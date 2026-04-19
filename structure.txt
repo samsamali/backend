@@ -1,0 +1,123 @@
+backend/
+├── config/
+│   └── db.js               # Database configuration
+│   └── selectors.js        # Supplier Website Layout CSS Selectors
+├── modules/
+│   ├── uploads  all picture here 
+│   ├── admin             # admin panel   
+│   │   ├── controllers
+│   │   │      └── groupController.js
+│   │   │      └── moduleController.js
+│   │   │      └── permissionController.js
+│   │   │      └── routeController.js
+│   │   ├── middlewares
+│   │   │      └── adminMiddleware.js
+│   │   ├── models
+│   │   │      └── Group.js            
+│   │   │      └── UserGroup.js        
+│   │   │      └── GroupPermission.js      
+│   │   │      └── Permission.js
+│   │   │      └── Route.js
+│   │   │      └── Module.js
+│   │   │      └── ModulePermission.js
+│   │   │      └── UserModuleStatus.js
+│   │   ├── routes
+│   │   │      └── adminRoutes.js
+│   │   ├── services
+│   │   │      └── adminService.js
+│   ├── auth/               # Authentication module
+│   │   ├── userControllers.js
+│   │   ├── userRoutes.js
+│   │   ├── userService.js
+│   ├── auth/               # Authentication module
+│   │   ├── controllers/
+│   │   │   └── authController.js
+│   │   │   └── UploadController.js
+│   │   ├── middlewares/
+│   │   │   └── authMiddleware.js
+│   │   ├── models/
+│   │   │   └── User.js
+│   │   │   └── UpdateUserProfile.js
+│   │   ├── routes/
+│   │   │   └── authRoutes.js
+│   │   │   └── uploadRoutes.js
+│   │   ├── services/
+│   │   │   └── authService.js
+│   │   └── utils/
+│   │       └── email.js
+│   │       └── passwordUtils.js
+│   ├── company/            # Company management module
+│   │   ├── controllers/
+│   │   │   └── companyController.js
+│   │   ├── models/
+│   │   │   └── Company.js
+│   │   ├── routes/
+│   │   │   └── companyRoutes.js
+│   │   ├── services/
+│   │   │   └── companyService.js
+│   │   └── middlewares/
+│   │       └── companyMiddleware.js
+│   ├── product/            # Product management module
+│   │   ├── controllers/
+│   │   │   └── productController.js
+│   │   ├── models/
+│   │   │   └── Product.js
+│   │   ├── routes/
+│   │   │   └── productRoutes.js
+│   │   ├── services/
+│   │   │   └── productService.js
+│   │   ├── scrapers/
+│   │   │   └── temuScraper.js
+│   │   └── utils/
+│   │       └── productUtils.js
+│   ├── role/               # Role-based access control module
+│   │   ├── controllers/
+│   │   │   └── roleController.js
+│   │   ├── middlewares/
+│   │   │   └── roleMiddleware.js
+│   │   ├── models/
+│   │   │   └── role-permissions.js
+│   │   │   └── Role.js
+│   │   │   └── UserRole.js
+│   │   ├── routes/
+│   │   │   └── roleRoutes.js
+│   │   ├── services/
+│   │   │   └── roleService.js
+│   │   └── utils/
+│   │       └── roleUtils.js
+│   ├── subscription/       # Subscription management module
+│   │   ├── controllers/
+│   │   │   └── subscriptionController.js
+│   │   ├── models/
+│   │   │   └── Subscription.js
+│   │   ├── routes/
+│   │   │   └── subscriptionRoutes.js
+│   │   ├── services/
+│   │   │   └── subscriptionService.js
+│   │   └── utils/
+│   │       └── subscriptionUtils.js
+│   ├── expense/            # Expense management module
+│   │   ├── controllers/
+│   │   │   └── expenseController.js
+│   │   ├── models/
+│   │   │   └── Expense.js
+│   │   ├── routes/
+│   │   │   └── expenseRoutes.js
+│   │   ├── services/
+│   │   │   └── expenseService.js
+│   │   └── utils/
+│   │       └── expenseUtils.js
+│   └── dashboard/          # Dashboard module
+│       ├── controllers/
+│       │   └── dashboardController.js
+│       ├── routes/
+│       │   └── dashboardRoutes.js
+│       ├── services/
+│           └── dashboardService.js
+├── middlewares/            # Shared middleware
+│   └── globalErrorHandler.js
+├── utils/                  # Shared utilities
+│   └── logger.js
+├── server.js               # Entry point for the backend server
+├── .env                    # Environment variables
+└── package.json            # Project configuration and dependencies
