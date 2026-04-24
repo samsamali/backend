@@ -19,7 +19,10 @@ const updatePasswordRoutes = require('./modules/auth/routes/updatePasswordRoutes
 const adminRoutes = require('./modules/admin/routes/adminRoutes');
 const ebayRoutes = require("./modules/eBay/routes/ebayRoutes");
 const sellviaRoutes = require('../backend/modules/admin/routes/sellviaRoutes');
-
+const companyStoreRoutes = require('./modules/admin/routes/companyStoreRoutes');
+// const dns = require('dns');
+// // Force reliable DNS servers (Cloudflare and Google)
+// dns.setServers(['1.1.1.1', '8.8.8.8', '1.0.0.1', '8.8.4.4']);
 
 // Load environment variables
 dotenv.config();
@@ -70,6 +73,7 @@ app.use('/api/auth', updatePasswordRoutes);
 app.use('/api/admin', adminRoutes);
 app.use("/api/ebay", ebayRoutes);
 app.use('/api/sellvia', sellviaRoutes);
+app.use('/api/company-stores', companyStoreRoutes);
 
 
 // Connect to MongoDB

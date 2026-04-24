@@ -8,8 +8,6 @@ const SellviaOrder     = require('../models/SellviaOrder');
 const SellviaHome      = require('../models/SellviaHome');
 const CompanyStore     = require('../models/CompanyStore');
 const mongoose         = require('mongoose');
-const syncQueue = new Map(); // Track ongoing syncs
-const SYNC_TIMEOUT = 120000; // 2 minutes timeout
 
 // ================================================================
 //  STORE DOMAIN MAP — emergency fallback only
@@ -998,30 +996,89 @@ router.post('/sync-home-data/:dashboard_id', verifyToken, async (req, res) => {
         const dashboard        = await SellviaDashboard.findOne(query);
         if (!dashboard) return res.status(404).json({ error: 'Dashboard not found' });
 
-        const response = await axios.post(
-            `${dashboard.base_url}/rest/v1/account/MyAccount/getMyAccountData`, {},
-            { headers: { 'Authorization': dashboard.jwt_token, 'Content-Type': 'application/x-www-form-urlencoded', 'Cookie': `sell_account_token=${dashboard.jwt_token}`, 'X-Requested-With': 'XMLHttpRequest', 'User-Agent': 'Mozilla/5.0' }, timeout: 30000, transformResponse: [(d) => d] }
-        );
-        const parsed = parseSellviaResponse(response.data);
+        // ── Try Sellvia API ─────────────────────────────────────
+        let parsed = null;
+        try {
+            const response = await axios.post(
+                `${dashboard.base_url}/rest/v1/account/MyAccount/getMyAccountData`, {},
+                {
+                    headers: {
+                        'Authorization':    dashboard.jwt_token,
+                        'Content-Type':     'application/x-www-form-urlencoded',
+                        'Cookie':           `sell_account_token=${dashboard.jwt_token}`,
+                        'X-Requested-With': 'XMLHttpRequest',
+                        'User-Agent':       'Mozilla/5.0',
+                    },
+                    timeout: 30000,
+                    transformResponse: [(d) => d],
+                }
+            );
+            parsed = parseSellviaResponse(response.data);
+        } catch (apiErr) {
+            console.warn(`[sync-home-data] Sellvia API failed for dashboard ${dashboard_id}: ${apiErr.message}`);
+            // ── Return zeros gracefully (don't 500) ───────────────
+            return res.json({
+                success: true,
+                data: {
+                    sellvia_dashboard_id: toObjId(dashboard_id),
+                    total_earnings: 0, amount_payout: 0, balance_summary: 0,
+                    progress: {
+                        available_display: '0.00', available_pr: 0,
+                        incoming_display: '0.00', incoming_pr: 0,
+                        amount_pending_display: '0.00', amount_pending_pr: 0,
+                        reserves_display: '0.00', reserves_pr: 100,
+                    },
+                    show_withdraw: false,
+                    _api_error: apiErr.message,
+                },
+                message: 'API unavailable — showing cached or zero data',
+            });
+        }
 
         if (parsed?.status === 'success' && parsed?.data) {
             const data     = parsed.data;
             const homeData = {
                 sellvia_dashboard_id: toObjId(dashboard_id), user_id: toObjId(req.user.id),
-                total_earnings: parseFloat(data.total_earnings) || 0, total_earnings_display: data.total_earnings_display || '0.00',
-                amount_wallet: parseFloat(data.amount_wallet) || 0, amount_payout: parseFloat(data.amount_payout) || 0,
-                amount_payout_display: data.amount_payout_display || '0.00', balance_summary: parseFloat(data.balance_summary) || 0,
-                balance_summary_display: data.balance_summary_display || '0.00', balance: parseFloat(data.balance) || 0,
-                balance_all_display: data.balance_all_display || '0.00',
-                fastsource_balance: data.$FastSource_balance || {}, progress: data.progress || {},
-                show_withdraw: data.show_withdraw || false, store_id: store_id || null,
-                raw_response: data, last_synced_at: new Date(),
+                total_earnings:           parseFloat(data.total_earnings)    || 0,
+                total_earnings_display:   data.total_earnings_display        || '0.00',
+                amount_wallet:            parseFloat(data.amount_wallet)     || 0,
+                amount_payout:            parseFloat(data.amount_payout)     || 0,
+                amount_payout_display:    data.amount_payout_display         || '0.00',
+                balance_summary:          parseFloat(data.balance_summary)   || 0,
+                balance_summary_display:  data.balance_summary_display       || '0.00',
+                balance:                  parseFloat(data.balance)           || 0,
+                balance_all_display:      data.balance_all_display           || '0.00',
+                fastsource_balance:       data.$FastSource_balance           || {},
+                progress:                 data.progress                      || {},
+                show_withdraw:            data.show_withdraw                 || false,
+                store_id:                 store_id                           || null,
+                raw_response:             data,
+                last_synced_at:           new Date(),
             };
-            const filter = { sellvia_dashboard_id: toObjId(dashboard_id), ...(store_id ? { store_id: String(store_id) } : { store_id: null }) };
-            const home   = await SellviaHome.findOneAndUpdate(filter, { $set: homeData }, { upsert: true, new: true });
+            const filter = {
+                sellvia_dashboard_id: toObjId(dashboard_id),
+                ...(store_id ? { store_id: String(store_id) } : { store_id: null }),
+            };
+            const home = await SellviaHome.findOneAndUpdate(filter, { $set: homeData }, { upsert: true, new: true });
             res.json({ success: true, data: home, message: 'Home data synced successfully' });
         } else {
-            res.status(400).json({ error: 'Failed to fetch data from Sellvia' });
+            // Sellvia returned non-success (e.g. JWT expired) — return zeros
+            console.warn(`[sync-home-data] Sellvia returned non-success for dashboard ${dashboard_id}`);
+            res.json({
+                success: true,
+                data: {
+                    sellvia_dashboard_id: toObjId(dashboard_id),
+                    total_earnings: 0, amount_payout: 0, balance_summary: 0,
+                    progress: {
+                        available_display: '0.00', available_pr: 0,
+                        incoming_display: '0.00', incoming_pr: 0,
+                        amount_pending_display: '0.00', amount_pending_pr: 0,
+                        reserves_display: '0.00', reserves_pr: 100,
+                    },
+                    show_withdraw: false,
+                },
+                message: 'JWT may be expired — showing zero data',
+            });
         }
     } catch (error) {
         console.error('[sync-home-data] error:', error.message);
@@ -1091,6 +1148,15 @@ const autoSyncAllDashboards = async () => {
 
         for (const dashboard of dashboards) {
             try {
+                // ── Step 1: Update store info fields from Sellvia API ──────────
+                try {
+                    const updatedCount = await syncStoreInfoFromAPI(dashboard, String(dashboard._id));
+                    console.log(`[AutoSync] Store info updated for dash=${dashboard._id}, stores=${updatedCount}`);
+                } catch (infoErr) {
+                    console.error(`[AutoSync] Store info sync failed for dash=${dashboard._id}:`, infoErr.message);
+                }
+
+                // ── Step 2: Sync orders for each store ─────────────────────────
                 const stores = await SellviaStore.find({ sellvia_dashboard_id: dashboard._id }).sort({ store_name: 1 });
                 if (!stores.length) continue;
                 let totalSynced = 0;
@@ -1102,6 +1168,10 @@ const autoSyncAllDashboards = async () => {
                         if (!result.success || !result.orders?.length) { console.log(`[AutoSync] No orders for store=${store.store_id}`); continue; }
                         const saved = await saveOrdersToDatabase(String(dashboard._id), store, result.orders);
                         totalSynced += saved;
+                        // Update last_synced_at and total_orders_cached on the store document
+                        await SellviaStore.findByIdAndUpdate(store._id, {
+                            $set: { last_synced_at: new Date(), total_orders_cached: (store.total_orders_cached || 0) + saved },
+                        });
                         console.log(`[AutoSync] ✓ dash=${dashboard._id} store=${store.store_id} saved=${saved}`);
                     } catch (storeErr) { console.error(`[AutoSync] store=${store.store_id} error:`, storeErr.message); }
                 }
@@ -1118,63 +1188,27 @@ setTimeout(() => {
     setInterval(autoSyncAllDashboards, AUTO_SYNC_MS);
 }, 2 * 60 * 1000);
 
+// ================================================================
+//  TOKEN: Generate / regenerate store token
+// ================================================================
+router.post('/generate-store-token/:store_id', verifyToken, async (req, res) => {
+    try {
+        const { store_id } = req.params;
+        const store = await SellviaStore.findOne({ store_id: String(store_id) });
+        if (!store) return res.status(404).json({ error: 'Store not found' });
 
+        const domain = (store.store_domain || store.store_id || 'store').replace(/^https?:\/\//i, '').replace(/\/$/, '');
+        const rand = require('crypto').randomBytes(20).toString('hex');
+        const token = `${domain}-${rand}`;
 
+        store.store_token = token;
+        await store.save();
 
-// In your sync route handler:
-router.post('/sync-home-data/:storeId', async (req, res) => {
-  const { storeId } = req.params;
-  
-  // Check if sync is already in progress for this store
-  if (syncQueue.has(storeId)) {
-    console.log(`[sync-home-data] Sync already in progress for store ${storeId}`);
-    return res.status(202).json({ 
-      message: 'Sync already in progress',
-      status: 'pending'
-    });
-  }
-  
-  // Mark as syncing
-  syncQueue.set(storeId, true);
-  
-  try {
-    // Set a timeout for the entire operation
-    const syncPromise = performSync(storeId); // Your actual sync logic
-    
-    const result = await Promise.race([
-      syncPromise,
-      new Promise((_, reject) => 
-        setTimeout(() => reject(new Error('Sync timeout')), SYNC_TIMEOUT)
-      )
-    ]);
-    
-    res.json({ success: true, ...result });
-  } catch (error) {
-    console.error(`[sync-home-data] Error for store ${storeId}:`, error.message);
-    
-    if (error.message === 'Sync timeout') {
-      res.status(504).json({ 
-        error: 'Sync timeout - will continue in background',
-        storeId 
-      });
-    } else if (error.code === 'ECONNRESET' || error.code === 'ECONNABORTED') {
-      res.status(503).json({ 
-        error: 'Connection interrupted - please try again',
-        storeId 
-      });
-    } else {
-      res.status(500).json({ 
-        error: 'Sync failed',
-        message: error.message 
-      });
+        res.json({ success: true, token });
+    } catch (error) {
+        console.error('[generate-store-token] error:', error.message);
+        res.status(500).json({ error: 'Failed to generate token: ' + error.message });
     }
-  } finally {
-    // Clear the sync flag after a delay (to prevent immediate re-sync)
-    setTimeout(() => {
-      syncQueue.delete(storeId);
-    }, 5000);
-  }
 });
-
 
 module.exports = router;

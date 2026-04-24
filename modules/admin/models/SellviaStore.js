@@ -63,6 +63,12 @@ const sellviaStoreSchema = new mongoose.Schema({
         default: '',
     },
 
+    // ── Token ─────────────────────────────────────────────────────
+    store_token: {
+        type: String,
+        default: '',
+    },
+
     // ── Sync tracking ─────────────────────────────────────────────
     last_synced_at: {     // when orders were last auto-synced from backend scheduler
         type: Date,
