@@ -13,24 +13,38 @@ const generateStoreToken = () => `MS-${crypto.randomBytes(24).toString('hex')}`;
 // ── Fetch all products from a connected WP site and save to MongoDB ────────────
 const syncProductsFromStore = async (store) => {
     const baseUrl = store.site_url.replace(/\/$/, '');
+    const tokenPreview = (store.token || '').substring(0, 20) + '...';
+    console.log(`[WP Sync] Starting → site="${baseUrl}" token="${tokenPreview}" storeId="${store._id}"`);
+
     let allProducts = [];
     let page = 1;
 
     while (true) {
-        const res = await axios.get(`${baseUrl}/wp-json/marketsync/v1/products`, {
-            headers: { 'X-Marketsync-Token': store.token },
-            params:  { per_page: 50, page },
-            timeout: 30000,
-        });
+        try {
+            const res = await axios.get(`${baseUrl}/wp-json/marketsync/v1/products`, {
+                headers: { 'X-Marketsync-Token': store.token },
+                params:  { per_page: 50, page },
+                timeout: 30000,
+            });
 
-        const data = res.data;
-        if (!data.success || !Array.isArray(data.data) || data.data.length === 0) break;
+            const data = res.data;
+            console.log(`[WP Sync] Page ${page} → success=${data.success} count=${data.data?.length ?? 0} total=${data.total ?? '?'}`);
 
-        allProducts = [...allProducts, ...data.data];
-        if (page >= (data.total_pages || 1)) break;
-        page++;
-        await new Promise(r => setTimeout(r, 150)); // be nice to the WP server
+            if (!data.success || !Array.isArray(data.data) || data.data.length === 0) break;
+
+            allProducts = [...allProducts, ...data.data];
+            if (page >= (data.total_pages || 1)) break;
+            page++;
+            await new Promise(r => setTimeout(r, 150));
+        } catch (pageErr) {
+            const status = pageErr.response?.status;
+            const body   = pageErr.response?.data;
+            console.error(`[WP Sync] Page ${page} fetch error: status=${status} msg="${pageErr.message}" body=${JSON.stringify(body)}`);
+            throw pageErr;
+        }
     }
+
+    console.log(`[WP Sync] Fetched ${allProducts.length} products — saving to MongoDB...`);
 
     let saved = 0;
     for (const product of allProducts) {
@@ -258,6 +272,43 @@ router.post('/stores/:id/sync', verifyToken, async (req, res) => {
     } catch (error) {
         console.error('[WP manual sync] error:', error.message);
         res.status(500).json({ error: 'Sync failed: ' + error.message });
+    }
+});
+
+// ================================================================
+//  PROTECTED — Debug: test plugin connectivity for a store
+// ================================================================
+router.get('/stores/:id/debug', verifyToken, async (req, res) => {
+    try {
+        const store = await WordpressStore.findById(req.params.id);
+        if (!store) return res.status(404).json({ error: 'Store not found' });
+
+        const baseUrl = (store.site_url || '').replace(/\/$/, '');
+        const result  = { store_id: store._id, site_url: baseUrl, is_connected: store.is_connected, token_preview: (store.token || '').substring(0, 20) + '...' };
+
+        // Test 1: /info (public, no auth needed)
+        try {
+            const infoRes = await axios.get(`${baseUrl}/wp-json/marketsync/v1/info`, { timeout: 15000 });
+            result.plugin_info = infoRes.data;
+        } catch (e) {
+            result.plugin_info_error = `${e.response?.status || 'network'}: ${e.message}`;
+        }
+
+        // Test 2: /products (requires token auth)
+        try {
+            const prodRes = await axios.get(`${baseUrl}/wp-json/marketsync/v1/products`, {
+                headers: { 'X-Marketsync-Token': store.token },
+                params:  { per_page: 1, page: 1 },
+                timeout: 15000,
+            });
+            result.products_test = { success: prodRes.data.success, total: prodRes.data.total, first_product: prodRes.data.data?.[0]?.name || null };
+        } catch (e) {
+            result.products_test_error = `${e.response?.status || 'network'}: ${e.message} body=${JSON.stringify(e.response?.data)}`;
+        }
+
+        res.json(result);
+    } catch (error) {
+        res.status(500).json({ error: error.message });
     }
 });
 
