@@ -69,6 +69,32 @@ const sellviaStoreSchema = new mongoose.Schema({
         default: '',
     },
 
+    // ── WordPress plugin connection ────────────────────────────────
+    wp_is_connected: {
+        type: Boolean,
+        default: false,
+    },
+    wp_site_url: {
+        type: String,
+        default: '',
+    },
+    wp_connected_at: {
+        type: Date,
+        default: null,
+    },
+    wp_plugin_version: {
+        type: String,
+        default: '',
+    },
+    wp_total_products: {
+        type: Number,
+        default: 0,
+    },
+    wp_last_synced_at: {
+        type: Date,
+        default: null,
+    },
+
     // ── Sync tracking ─────────────────────────────────────────────
     last_synced_at: {     // when orders were last auto-synced from backend scheduler
         type: Date,

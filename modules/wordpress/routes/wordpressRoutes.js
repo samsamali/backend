@@ -5,6 +5,7 @@ const crypto     = require('crypto');
 const { verifyToken } = require('../../auth/middlewares/authMiddleware');
 const WordpressStore   = require('../models/WordpressStore');
 const WordpressProduct = require('../models/WordpressProduct');
+const SellviaStore     = require('../../admin/models/SellviaStore');
 
 // ── Generate a unique MarketSync store token ───────────────────────────────────
 const generateStoreToken = () => `MS-${crypto.randomBytes(24).toString('hex')}`;
@@ -74,6 +75,13 @@ const syncProductsFromStore = async (store) => {
     return { total: allProducts.length, saved };
 };
 
+// ── Helper: normalize a URL/domain to plain hostname ─────────────────────────
+const normalizeHost = (urlOrDomain) => {
+    if (!urlOrDomain) return '';
+    try { return new URL(urlOrDomain).hostname.replace(/^www\./i, '').toLowerCase(); }
+    catch (_) { return urlOrDomain.replace(/^https?:\/\//i, '').replace(/\/$/, '').replace(/^www\./i, '').split('/')[0].toLowerCase(); }
+};
+
 // ================================================================
 //  PUBLIC — WordPress plugin calls this to connect
 // ================================================================
@@ -85,30 +93,73 @@ router.post('/plugin-connect', async (req, res) => {
             return res.status(400).json({ success: false, message: 'token and siteUrl are required' });
         }
 
-        const store = await WordpressStore.findOne({ token });
-        if (!store) {
-            return res.status(401).json({
-                success: false,
-                message: 'Invalid token. Generate a token from MarketSync dashboard first.',
-            });
-        }
+        // ── Step 1: Look up token in WordpressStore ───────────────
+        let store = await WordpressStore.findOne({ token });
 
-        // Token already in use by a DIFFERENT site → reject
-        if (store.is_connected && store.site_url && store.site_url !== siteUrl) {
-            return res.status(403).json({
-                success: false,
-                message: 'This token is already used by another store. Each store needs its own token.',
-            });
-        }
+        if (store) {
+            // Token already in use by a DIFFERENT site → reject
+            if (store.is_connected && store.site_url && store.site_url !== siteUrl) {
+                return res.status(403).json({
+                    success: false,
+                    message: 'This token is already used by another store. Each store needs its own token.',
+                });
+            }
+            store.site_url       = siteUrl;
+            store.store_name     = storeName   || store.store_name;
+            store.platform       = platform    || 'wordpress';
+            store.plugin_secret  = pluginSecret  || '';
+            store.plugin_version = pluginVersion || '';
+            store.is_connected   = true;
+            store.connected_at   = new Date();
+            await store.save();
+        } else {
+            // ── Step 2: Look up token in SellviaStore.store_token ─
+            const sellviaStore = await SellviaStore.findOne({ store_token: token });
 
-        store.site_url       = siteUrl;
-        store.store_name     = storeName   || store.store_name;
-        store.platform       = platform    || 'wordpress';
-        store.plugin_secret  = pluginSecret  || '';
-        store.plugin_version = pluginVersion || '';
-        store.is_connected   = true;
-        store.connected_at   = new Date();
-        await store.save();
+            if (!sellviaStore) {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Invalid token. Generate a token from MarketSync dashboard first.',
+                });
+            }
+
+            // ── Step 3: Validate domain — token must match the connecting store ──
+            const connectingHost = normalizeHost(siteUrl);
+            const storedHost     = normalizeHost(sellviaStore.store_domain || sellviaStore.store_name);
+
+            if (storedHost && connectingHost !== storedHost) {
+                return res.status(403).json({
+                    success: false,
+                    message: `This token belongs to "${storedHost}", not "${connectingHost}". Use the correct store's token.`,
+                });
+            }
+
+            // ── Step 4: Update SellviaStore with WP connection info ──
+            sellviaStore.wp_is_connected   = true;
+            sellviaStore.wp_site_url       = siteUrl;
+            sellviaStore.wp_connected_at   = new Date();
+            sellviaStore.wp_plugin_version = pluginVersion || '';
+            await sellviaStore.save();
+
+            // ── Step 5: Create/update a WordpressStore record so products ──
+            //           appear in the WordPress products page
+            store = await WordpressStore.findOneAndUpdate(
+                { token },
+                {
+                    $set: {
+                        store_name:     storeName || sellviaStore.store_name || storedHost,
+                        site_url:       siteUrl,
+                        platform:       platform || 'sellvia',
+                        plugin_version: pluginVersion || '',
+                        is_connected:   true,
+                        connected_at:   new Date(),
+                    },
+                },
+                { upsert: true, new: true, setDefaultsOnInsert: true }
+            );
+
+            console.log(`[plugin-connect] SellviaStore token matched → store="${storedHost}" site="${siteUrl}"`);
+        }
 
         // Auto-sync products in background (don't block the plugin's HTTP response)
         syncProductsFromStore(store).catch(err => {
