@@ -13,7 +13,7 @@ const wordpressStoreSchema = new mongoose.Schema({
     },
     platform: {
         type: String,
-        default: 'wordpress',  // wordpress | woocommerce | sellvia
+        default: 'wordpress',
     },
     token: {
         type: String,
@@ -23,10 +23,6 @@ const wordpressStoreSchema = new mongoose.Schema({
     is_connected: {
         type: Boolean,
         default: false,
-    },
-    plugin_secret: {
-        type: String,
-        default: '',
     },
     plugin_version: {
         type: String,
@@ -48,6 +44,13 @@ const wordpressStoreSchema = new mongoose.Schema({
         type: mongoose.Schema.Types.ObjectId,
         ref: 'User',
         default: null,
+    },
+    // Links this WP store to a SellviaStore — prevents old-token reconnection and duplicate stores
+    sellvia_store_id: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'SellviaStore',
+        default: null,
+        index: true,
     },
 }, {
     timestamps: { createdAt: 'created_at', updatedAt: 'updated_at' },

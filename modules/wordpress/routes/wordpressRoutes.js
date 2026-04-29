@@ -2,6 +2,7 @@ const express    = require('express');
 const router     = express.Router();
 const axios      = require('axios');
 const crypto     = require('crypto');
+const mongoose   = require('mongoose');
 const { verifyToken } = require('../../auth/middlewares/authMiddleware');
 const WordpressStore   = require('../models/WordpressStore');
 const WordpressProduct = require('../models/WordpressProduct');
@@ -46,7 +47,6 @@ const syncProductsFromStore = async (store) => {
 
     console.log(`[WP Sync] Fetched ${allProducts.length} products — saving to MongoDB...`);
 
-    // Log raw structure of first product so we can verify what fields the plugin returns
     if (allProducts.length > 0) {
         const sample = allProducts[0];
         console.log(`[WP Sync] First product keys: ${Object.keys(sample).join(', ')}`);
@@ -68,11 +68,11 @@ const syncProductsFromStore = async (store) => {
                     description:       product.description       || '',
                     short_description: product.short_description || '',
                     sku:               product.sku               || '',
-                    price:             product.price             || '0',
-                    regular_price:     product.regular_price     || '0',
-                    sale_price:        product.sale_price        || '',
+                    price:             String(product.price      ?? '0'),
+                    regular_price:     String(product.regular_price ?? '0'),
+                    sale_price:        String(product.sale_price ?? ''),
                     stock_status:      product.stock_status      || 'instock',
-                    stock_quantity:    product.stock_quantity    || 0,
+                    stock_quantity:    product.stock_quantity != null ? Number(product.stock_quantity) : 0,
                     images:            product.images            || [],
                     categories:        product.categories        || [],
                     tags:              product.tags              || [],
@@ -108,13 +108,13 @@ const normalizeHost = (urlOrDomain) => {
 // ================================================================
 router.post('/plugin-connect', async (req, res) => {
     try {
-        const { token, siteUrl, storeName, platform, pluginSecret, pluginVersion } = req.body;
+        const { token, siteUrl, storeName, platform, pluginVersion } = req.body;
 
         if (!token || !siteUrl) {
             return res.status(400).json({ success: false, message: 'token and siteUrl are required' });
         }
 
-        // ── Step 1: Look up token in WordpressStore ───────────────
+        // ── Step 1: Look up token in WordpressStore (MS-xxx tokens) ──
         let store = await WordpressStore.findOne({ token });
 
         if (store) {
@@ -128,13 +128,12 @@ router.post('/plugin-connect', async (req, res) => {
             store.site_url       = siteUrl;
             store.store_name     = storeName   || store.store_name;
             store.platform       = platform    || 'wordpress';
-            store.plugin_secret  = pluginSecret  || '';
             store.plugin_version = pluginVersion || '';
             store.is_connected   = true;
             store.connected_at   = new Date();
             await store.save();
         } else {
-            // ── Step 2: Look up token in SellviaStore.store_token ─
+            // ── Step 2: Look up token in SellviaStore.store_token ────────
             const sellviaStore = await SellviaStore.findOne({ store_token: token });
 
             if (!sellviaStore) {
@@ -144,7 +143,7 @@ router.post('/plugin-connect', async (req, res) => {
                 });
             }
 
-            // ── Step 3: Validate domain — token must match the connecting store ──
+            // ── Step 3: Validate domain ──────────────────────────────────
             const connectingHost = normalizeHost(siteUrl);
             const storedHost     = normalizeHost(sellviaStore.store_domain || sellviaStore.store_name);
 
@@ -155,34 +154,65 @@ router.post('/plugin-connect', async (req, res) => {
                 });
             }
 
-            // ── Step 4: Update SellviaStore with WP connection info ──
+            // ── Step 3.5: Token revocation check ─────────────────────────
+            // If admin regenerated the token, there's already a linked WP store
+            // with a DIFFERENT token. Reject the old token.
+            const existingLink = await WordpressStore.findOne({
+                sellvia_store_id: sellviaStore._id,
+                is_connected:     true,
+            });
+            if (existingLink && existingLink.token !== token) {
+                return res.status(401).json({
+                    success: false,
+                    message: 'Your MarketSync token was regenerated. Please copy the new token from the MarketSync dashboard and re-enter it in the plugin settings.',
+                });
+            }
+
+            // ── Step 4: Update SellviaStore with WP connection info ──────
             sellviaStore.wp_is_connected   = true;
             sellviaStore.wp_site_url       = siteUrl;
             sellviaStore.wp_connected_at   = new Date();
             sellviaStore.wp_plugin_version = pluginVersion || '';
             await sellviaStore.save();
 
-            // ── Step 5: Create/update a WordpressStore record so products ──
-            //           appear in the WordPress products page
-            store = await WordpressStore.findOneAndUpdate(
-                { token },
-                {
-                    $set: {
-                        store_name:     storeName || sellviaStore.store_name || storedHost,
-                        site_url:       siteUrl,
-                        platform:       platform || 'sellvia',
-                        plugin_version: pluginVersion || '',
-                        is_connected:   true,
-                        connected_at:   new Date(),
-                    },
-                },
-                { upsert: true, new: true, setDefaultsOnInsert: true }
-            );
+            // ── Step 5: Create/update WordpressStore ─────────────────────
+            // Upsert by sellvia_store_id (prevents duplicate stores on reconnect)
+            let existingWPStore = await WordpressStore.findOne({ sellvia_store_id: sellviaStore._id });
+            if (!existingWPStore) {
+                // Backward compat: find by token (old records without sellvia_store_id)
+                existingWPStore = await WordpressStore.findOne({ token });
+            }
+
+            const storeData = {
+                token,
+                sellvia_store_id: sellviaStore._id,
+                store_name:       storeName || sellviaStore.store_name || storedHost,
+                site_url:         siteUrl,
+                platform:         platform || 'sellvia',
+                plugin_version:   pluginVersion || '',
+                is_connected:     true,
+                connected_at:     new Date(),
+            };
+
+            if (existingWPStore) {
+                Object.assign(existingWPStore, storeData);
+                store = await existingWPStore.save();
+            } else {
+                store = await WordpressStore.create(storeData);
+            }
+
+            // Clean up orphaned disconnected duplicates with same site_url
+            await WordpressStore.deleteMany({
+                site_url:   siteUrl,
+                _id:        { $ne: store._id },
+                is_connected: false,
+                total_products_cached: 0,
+            });
 
             console.log(`[plugin-connect] SellviaStore token matched → store="${storedHost}" site="${siteUrl}"`);
         }
 
-        // Auto-sync products in background (don't block the plugin's HTTP response)
+        // Auto-sync products in background
         syncProductsFromStore(store).catch(err => {
             console.error(`[WP Sync] Auto-sync failed for ${siteUrl}:`, err.message);
         });
@@ -255,6 +285,8 @@ router.post('/stores/:id/regenerate-token', verifyToken, async (req, res) => {
         store.is_connected = false;
         store.site_url     = '';
         store.connected_at = null;
+        // Keep sellvia_store_id so the revocation check works —
+        // the old Sellvia token will now be rejected until the new MS-xxx token is used.
         await store.save();
 
         res.json({ success: true, token: store.token, store });
@@ -293,7 +325,6 @@ router.get('/stores/:id/debug', verifyToken, async (req, res) => {
         const baseUrl = (store.site_url || '').replace(/\/$/, '');
         const result  = { store_id: store._id, site_url: baseUrl, is_connected: store.is_connected, token_preview: (store.token || '').substring(0, 20) + '...' };
 
-        // Test 1: /info (public, no auth needed)
         try {
             const infoRes = await axios.get(`${baseUrl}/wp-json/marketsync/v1/info`, { timeout: 15000 });
             result.plugin_info = infoRes.data;
@@ -301,7 +332,6 @@ router.get('/stores/:id/debug', verifyToken, async (req, res) => {
             result.plugin_info_error = `${e.response?.status || 'network'}: ${e.message}`;
         }
 
-        // Test 2: /products (requires token auth) — return full first product for diagnosis
         try {
             const prodRes = await axios.get(`${baseUrl}/wp-json/marketsync/v1/products`, {
                 headers: { 'X-Marketsync-Token': store.token },
@@ -312,7 +342,7 @@ router.get('/stores/:id/debug', verifyToken, async (req, res) => {
             result.products_test = {
                 success:           prodRes.data.success,
                 total:             prodRes.data.total,
-                first_product_raw: firstProduct,          // full object for diagnosis
+                first_product_raw: firstProduct,
                 fields_present:    firstProduct ? Object.keys(firstProduct) : [],
             };
         } catch (e) {
@@ -326,22 +356,63 @@ router.get('/stores/:id/debug', verifyToken, async (req, res) => {
 });
 
 // ================================================================
+//  PROTECTED — All unique category names (for filter dropdown)
+// ================================================================
+router.get('/products/categories', verifyToken, async (req, res) => {
+    try {
+        const { store_id } = req.query;
+        const match = store_id && store_id !== 'all'
+            ? { wp_store_id: new mongoose.Types.ObjectId(store_id) }
+            : {};
+        const cats = await WordpressProduct.distinct('categories.name', match);
+        res.json({ success: true, categories: cats.filter(Boolean).sort() });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to fetch categories' });
+    }
+});
+
+// ================================================================
 //  PROTECTED — Get all synced WordPress products
+//  - Sorted: products with images first
+//  - Supports: search (name + category), category filter, store filter
 // ================================================================
 router.get('/products', verifyToken, async (req, res) => {
     try {
-        const { store_id, page = 1, per_page = 20, search } = req.query;
+        const { store_id, page = 1, per_page = 20, search, category } = req.query;
 
         const filter = {};
-        if (store_id && store_id !== 'all') filter.wp_store_id = store_id;
-        if (search && search.trim()) filter.name = { $regex: search.trim(), $options: 'i' };
+        if (store_id && store_id !== 'all') {
+            try { filter.wp_store_id = new mongoose.Types.ObjectId(store_id); }
+            catch (_) { filter.wp_store_id = store_id; }
+        }
+
+        // Search in both name and categories.name
+        if (search && search.trim()) {
+            const regex = { $regex: search.trim(), $options: 'i' };
+            filter.$or = [{ name: regex }, { 'categories.name': regex }];
+        }
+
+        // Category filter from dropdown
+        if (category && category !== 'all') {
+            filter['categories.name'] = { $regex: `^${category.trim()}$`, $options: 'i' };
+        }
 
         const parsedPage  = Math.max(1, parseInt(page));
         const parsedLimit = Math.min(100, Math.max(1, parseInt(per_page)));
         const skip        = (parsedPage - 1) * parsedLimit;
 
+        // Sort: products with images come first, then by synced_at desc
+        const pipeline = [
+            { $match: filter },
+            { $addFields: { _rank: { $cond: [{ $gt: [{ $size: { $ifNull: ['$images', []] } }, 0] }, 1, 0] } } },
+            { $sort: { _rank: -1, synced_at: -1 } },
+            { $skip: skip },
+            { $limit: parsedLimit },
+            { $project: { _rank: 0 } },
+        ];
+
         const [products, total] = await Promise.all([
-            WordpressProduct.find(filter).sort({ synced_at: -1 }).skip(skip).limit(parsedLimit),
+            WordpressProduct.aggregate(pipeline),
             WordpressProduct.countDocuments(filter),
         ]);
 
