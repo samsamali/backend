@@ -46,6 +46,13 @@ const syncProductsFromStore = async (store) => {
 
     console.log(`[WP Sync] Fetched ${allProducts.length} products — saving to MongoDB...`);
 
+    // Log raw structure of first product so we can verify what fields the plugin returns
+    if (allProducts.length > 0) {
+        const sample = allProducts[0];
+        console.log(`[WP Sync] First product keys: ${Object.keys(sample).join(', ')}`);
+        console.log(`[WP Sync] First product sample — id=${sample.id} name="${sample.name}" price="${sample.price}" regular_price="${sample.regular_price}" images=${JSON.stringify(sample.images)} categories=${JSON.stringify(sample.categories)} sku="${sample.sku}"`);
+    }
+
     let saved = 0;
     for (const product of allProducts) {
         await WordpressProduct.findOneAndUpdate(
@@ -294,14 +301,20 @@ router.get('/stores/:id/debug', verifyToken, async (req, res) => {
             result.plugin_info_error = `${e.response?.status || 'network'}: ${e.message}`;
         }
 
-        // Test 2: /products (requires token auth)
+        // Test 2: /products (requires token auth) — return full first product for diagnosis
         try {
             const prodRes = await axios.get(`${baseUrl}/wp-json/marketsync/v1/products`, {
                 headers: { 'X-Marketsync-Token': store.token },
                 params:  { per_page: 1, page: 1 },
                 timeout: 15000,
             });
-            result.products_test = { success: prodRes.data.success, total: prodRes.data.total, first_product: prodRes.data.data?.[0]?.name || null };
+            const firstProduct = prodRes.data.data?.[0] || null;
+            result.products_test = {
+                success:           prodRes.data.success,
+                total:             prodRes.data.total,
+                first_product_raw: firstProduct,          // full object for diagnosis
+                fields_present:    firstProduct ? Object.keys(firstProduct) : [],
+            };
         } catch (e) {
             result.products_test_error = `${e.response?.status || 'network'}: ${e.message} body=${JSON.stringify(e.response?.data)}`;
         }
