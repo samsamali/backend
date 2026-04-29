@@ -372,6 +372,72 @@ router.get('/products/categories', verifyToken, async (req, res) => {
 });
 
 // ================================================================
+//  PROTECTED — Upsert a single product by wp_product_id
+// ================================================================
+router.post('/sync-product', verifyToken, async (req, res) => {
+    try {
+        const {
+            wp_store_id, wp_product_id,
+            name, slug, description, short_description,
+            sku, price, regular_price, sale_price,
+            stock_status, stock_quantity,
+            images, categories, tags,
+            status, date_created, currency,
+            site_url, store_name,
+        } = req.body;
+
+        if (!wp_store_id || wp_product_id == null) {
+            return res.status(400).json({ error: 'wp_store_id and wp_product_id are required' });
+        }
+
+        const store = await WordpressStore.findById(wp_store_id);
+        if (!store) return res.status(404).json({ error: 'Store not found' });
+
+        const product = await WordpressProduct.findOneAndUpdate(
+            { wp_store_id: store._id, wp_product_id: Number(wp_product_id) },
+            {
+                $set: {
+                    wp_store_id:       store._id,
+                    site_url:          site_url          || store.site_url,
+                    store_name:        store_name        || store.store_name,
+                    wp_product_id:     Number(wp_product_id),
+                    name:              name              || '',
+                    slug:              slug              || '',
+                    description:       description       || '',
+                    short_description: short_description || '',
+                    sku:               sku               || '',
+                    price:             String(price      ?? '0'),
+                    regular_price:     String(regular_price ?? '0'),
+                    sale_price:        String(sale_price ?? ''),
+                    stock_status:      stock_status      || 'instock',
+                    stock_quantity:    stock_quantity != null ? Number(stock_quantity) : 0,
+                    images:            Array.isArray(images)     ? images     : [],
+                    categories:        Array.isArray(categories) ? categories : [],
+                    tags:              Array.isArray(tags)       ? tags       : [],
+                    status:            status            || 'publish',
+                    date_created:      date_created      || '',
+                    currency:          currency          || 'USD',
+                    synced_at:         new Date(),
+                },
+            },
+            { upsert: true, new: true }
+        );
+
+        // Keep total_products_cached in sync
+        const count = await WordpressProduct.countDocuments({ wp_store_id: store._id });
+        await WordpressStore.updateOne(
+            { _id: store._id },
+            { $set: { total_products_cached: count, last_synced_at: new Date() } }
+        );
+
+        res.json({ success: true, product });
+    } catch (error) {
+        console.error('[sync-product] error:', error.message);
+        res.status(500).json({ error: 'Failed to upsert product: ' + error.message });
+    }
+});
+
+// ================================================================
 //  PROTECTED — Get all synced WordPress products
 //  - Sorted: products with images first
 //  - Supports: search (name + category), category filter, store filter
