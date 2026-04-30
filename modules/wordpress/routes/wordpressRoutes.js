@@ -242,13 +242,17 @@ router.post('/sync-product', verifyPluginToken, async (req, res) => {
         const store   = req.wpStore;
         const product = req.body.product || req.body;
 
-        if (!product || product.id == null) {
-            return res.status(400).json({ error: 'product.id is required' });
+        const productId = product?.id ?? product?.wp_product_id ?? product?.ID;
+        if (!product || productId == null) {
+            console.error('[sync-product] missing product id — body:', JSON.stringify(req.body).substring(0, 300));
+            return res.status(400).json({ error: 'product id is required (id, wp_product_id, or ID)' });
         }
+
+        // Normalize to .id so upsertProduct works
+        if (product.id == null) product.id = productId;
 
         const saved = await upsertProduct(store, product);
 
-        // Keep total_products_cached in sync
         const count = await WordpressProduct.countDocuments({ wp_store_id: store._id });
         await WordpressStore.updateOne(
             { _id: store._id },
@@ -257,7 +261,7 @@ router.post('/sync-product', verifyPluginToken, async (req, res) => {
 
         res.json({ success: true, product: saved });
     } catch (error) {
-        console.error('[sync-product] error:', error.message);
+        console.error('[sync-product] error:', error.message, '— body:', JSON.stringify(req.body).substring(0, 200));
         res.status(500).json({ error: 'Failed to upsert product: ' + error.message });
     }
 });
