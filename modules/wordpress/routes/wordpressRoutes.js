@@ -11,6 +11,24 @@ const SellviaStore     = require('../../admin/models/SellviaStore');
 // ── Generate a unique MarketSync store token ───────────────────────────────────
 const generateStoreToken = () => `MS-${crypto.randomBytes(24).toString('hex')}`;
 
+// ── Verify plugin request using X-Marketsync-Token header ────────────────────
+const verifyPluginToken = async (req, res, next) => {
+    try {
+        const pluginToken = req.headers['x-marketsync-token'] || req.body?.token;
+        if (!pluginToken) {
+            return res.status(401).json({ success: false, message: 'X-Marketsync-Token header required' });
+        }
+        const store = await WordpressStore.findOne({ token: pluginToken, is_connected: true });
+        if (!store) {
+            return res.status(401).json({ success: false, message: 'Invalid or unconnected plugin token' });
+        }
+        req.wpStore = store;
+        next();
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'Auth error: ' + err.message });
+    }
+};
+
 // ── Fetch all products from a connected WP site and save to MongoDB ────────────
 const syncProductsFromStore = async (store) => {
     const baseUrl = store.site_url.replace(/\/$/, '');
@@ -49,41 +67,12 @@ const syncProductsFromStore = async (store) => {
 
     if (allProducts.length > 0) {
         const sample = allProducts[0];
-        console.log(`[WP Sync] First product keys: ${Object.keys(sample).join(', ')}`);
-        console.log(`[WP Sync] First product sample — id=${sample.id} name="${sample.name}" price="${sample.price}" regular_price="${sample.regular_price}" images=${JSON.stringify(sample.images)} categories=${JSON.stringify(sample.categories)} sku="${sample.sku}"`);
+        console.log(`[WP Sync] First product sample — id=${sample.id} price="${sample.price}" images=${sample.images?.length ?? 0} categories=${sample.categories?.length ?? 0}`);
     }
 
     let saved = 0;
     for (const product of allProducts) {
-        await WordpressProduct.findOneAndUpdate(
-            { wp_store_id: store._id, wp_product_id: product.id },
-            {
-                $set: {
-                    wp_store_id:       store._id,
-                    site_url:          store.site_url,
-                    store_name:        store.store_name,
-                    wp_product_id:     product.id,
-                    name:              product.name              || '',
-                    slug:              product.slug              || '',
-                    description:       product.description       || '',
-                    short_description: product.short_description || '',
-                    sku:               product.sku               || '',
-                    price:             String(product.price      ?? '0'),
-                    regular_price:     String(product.regular_price ?? '0'),
-                    sale_price:        String(product.sale_price ?? ''),
-                    stock_status:      product.stock_status      || 'instock',
-                    stock_quantity:    product.stock_quantity != null ? Number(product.stock_quantity) : 0,
-                    images:            product.images            || [],
-                    categories:        product.categories        || [],
-                    tags:              product.tags              || [],
-                    status:            product.status            || 'publish',
-                    date_created:      product.date_created      || '',
-                    currency:          product.currency          || 'USD',
-                    synced_at:         new Date(),
-                },
-            },
-            { upsert: true, new: true }
-        );
+        await upsertProduct(store, product);
         saved++;
     }
 
@@ -92,8 +81,41 @@ const syncProductsFromStore = async (store) => {
         { $set: { last_synced_at: new Date(), total_products_cached: saved } }
     );
 
-    console.log(`[WP Sync] ✓ store="${store.store_name}" synced=${saved} total_fetched=${allProducts.length}`);
+    console.log(`[WP Sync] ✓ store="${store.store_name}" synced=${saved}`);
     return { total: allProducts.length, saved };
+};
+
+// ── Shared upsert helper (used by bulk sync AND single product sync) ──────────
+const upsertProduct = async (store, product) => {
+    return WordpressProduct.findOneAndUpdate(
+        { wp_store_id: store._id, wp_product_id: Number(product.id ?? product.wp_product_id) },
+        {
+            $set: {
+                wp_store_id:       store._id,
+                site_url:          store.site_url,
+                store_name:        store.store_name,
+                wp_product_id:     Number(product.id ?? product.wp_product_id),
+                name:              product.name              || '',
+                slug:              product.slug              || '',
+                description:       product.description       || '',
+                short_description: product.short_description || '',
+                sku:               product.sku               || '',
+                price:             String(product.price      ?? '0'),
+                regular_price:     String(product.regular_price ?? '0'),
+                sale_price:        String(product.sale_price ?? ''),
+                stock_status:      product.stock_status      || 'instock',
+                stock_quantity:    product.stock_quantity != null ? Number(product.stock_quantity) : 0,
+                images:            Array.isArray(product.images)     ? product.images     : [],
+                categories:        Array.isArray(product.categories) ? product.categories : [],
+                tags:              Array.isArray(product.tags)       ? product.tags       : [],
+                status:            product.status            || 'publish',
+                date_created:      product.date_created      || '',
+                currency:          product.currency          || 'USD',
+                synced_at:         new Date(),
+            },
+        },
+        { upsert: true, new: true }
+    );
 };
 
 // ── Helper: normalize a URL/domain to plain hostname ─────────────────────────
@@ -114,15 +136,13 @@ router.post('/plugin-connect', async (req, res) => {
             return res.status(400).json({ success: false, message: 'token and siteUrl are required' });
         }
 
-        // ── Step 1: Look up token in WordpressStore (MS-xxx tokens) ──
         let store = await WordpressStore.findOne({ token });
 
         if (store) {
-            // Token already in use by a DIFFERENT site → reject
             if (store.is_connected && store.site_url && store.site_url !== siteUrl) {
                 return res.status(403).json({
                     success: false,
-                    message: 'This token is already used by another store. Each store needs its own token.',
+                    message: 'This token is already used by another store.',
                 });
             }
             store.site_url       = siteUrl;
@@ -133,9 +153,7 @@ router.post('/plugin-connect', async (req, res) => {
             store.connected_at   = new Date();
             await store.save();
         } else {
-            // ── Step 2: Look up token in SellviaStore.store_token ────────
             const sellviaStore = await SellviaStore.findOne({ store_token: token });
-
             if (!sellviaStore) {
                 return res.status(401).json({
                     success: false,
@@ -143,20 +161,16 @@ router.post('/plugin-connect', async (req, res) => {
                 });
             }
 
-            // ── Step 3: Validate domain ──────────────────────────────────
             const connectingHost = normalizeHost(siteUrl);
             const storedHost     = normalizeHost(sellviaStore.store_domain || sellviaStore.store_name);
 
             if (storedHost && connectingHost !== storedHost) {
                 return res.status(403).json({
                     success: false,
-                    message: `This token belongs to "${storedHost}", not "${connectingHost}". Use the correct store's token.`,
+                    message: `This token belongs to "${storedHost}", not "${connectingHost}".`,
                 });
             }
 
-            // ── Step 3.5: Token revocation check ─────────────────────────
-            // If admin regenerated the token, there's already a linked WP store
-            // with a DIFFERENT token. Reject the old token.
             const existingLink = await WordpressStore.findOne({
                 sellvia_store_id: sellviaStore._id,
                 is_connected:     true,
@@ -164,22 +178,18 @@ router.post('/plugin-connect', async (req, res) => {
             if (existingLink && existingLink.token !== token) {
                 return res.status(401).json({
                     success: false,
-                    message: 'Your MarketSync token was regenerated. Please copy the new token from the MarketSync dashboard and re-enter it in the plugin settings.',
+                    message: 'Your MarketSync token was regenerated. Please copy the new token.',
                 });
             }
 
-            // ── Step 4: Update SellviaStore with WP connection info ──────
             sellviaStore.wp_is_connected   = true;
             sellviaStore.wp_site_url       = siteUrl;
             sellviaStore.wp_connected_at   = new Date();
             sellviaStore.wp_plugin_version = pluginVersion || '';
             await sellviaStore.save();
 
-            // ── Step 5: Create/update WordpressStore ─────────────────────
-            // Upsert by sellvia_store_id (prevents duplicate stores on reconnect)
             let existingWPStore = await WordpressStore.findOne({ sellvia_store_id: sellviaStore._id });
             if (!existingWPStore) {
-                // Backward compat: find by token (old records without sellvia_store_id)
                 existingWPStore = await WordpressStore.findOne({ token });
             }
 
@@ -201,7 +211,6 @@ router.post('/plugin-connect', async (req, res) => {
                 store = await WordpressStore.create(storeData);
             }
 
-            // Clean up orphaned disconnected duplicates with same site_url
             await WordpressStore.deleteMany({
                 site_url:   siteUrl,
                 _id:        { $ne: store._id },
@@ -225,6 +234,35 @@ router.post('/plugin-connect', async (req, res) => {
 });
 
 // ================================================================
+//  PUBLIC — Plugin pushes a single product (Force Re-Sync)
+//  Uses X-Marketsync-Token header instead of JWT
+// ================================================================
+router.post('/sync-product', verifyPluginToken, async (req, res) => {
+    try {
+        const store   = req.wpStore;
+        const product = req.body.product || req.body;
+
+        if (!product || product.id == null) {
+            return res.status(400).json({ error: 'product.id is required' });
+        }
+
+        const saved = await upsertProduct(store, product);
+
+        // Keep total_products_cached in sync
+        const count = await WordpressProduct.countDocuments({ wp_store_id: store._id });
+        await WordpressStore.updateOne(
+            { _id: store._id },
+            { $set: { total_products_cached: count, last_synced_at: new Date() } }
+        );
+
+        res.json({ success: true, product: saved });
+    } catch (error) {
+        console.error('[sync-product] error:', error.message);
+        res.status(500).json({ error: 'Failed to upsert product: ' + error.message });
+    }
+});
+
+// ================================================================
 //  PROTECTED — Create new WordPress store entry + generate token
 // ================================================================
 router.post('/stores', verifyToken, async (req, res) => {
@@ -233,17 +271,14 @@ router.post('/stores', verifyToken, async (req, res) => {
         if (!store_name || !store_name.trim()) {
             return res.status(400).json({ error: 'store_name is required' });
         }
-
         const token = generateStoreToken();
         const store = await WordpressStore.create({
             store_name: store_name.trim(),
             token,
             created_by: req.user.id,
         });
-
         res.json({ success: true, store });
     } catch (error) {
-        console.error('[WP create store] error:', error.message);
         res.status(500).json({ error: 'Failed to create store: ' + error.message });
     }
 });
@@ -280,15 +315,11 @@ router.post('/stores/:id/regenerate-token', verifyToken, async (req, res) => {
     try {
         const store = await WordpressStore.findById(req.params.id);
         if (!store) return res.status(404).json({ error: 'Store not found' });
-
         store.token        = generateStoreToken();
         store.is_connected = false;
         store.site_url     = '';
         store.connected_at = null;
-        // Keep sellvia_store_id so the revocation check works —
-        // the old Sellvia token will now be rejected until the new MS-xxx token is used.
         await store.save();
-
         res.json({ success: true, token: store.token, store });
     } catch (error) {
         res.status(500).json({ error: 'Failed to regenerate token' });
@@ -296,7 +327,7 @@ router.post('/stores/:id/regenerate-token', verifyToken, async (req, res) => {
 });
 
 // ================================================================
-//  PROTECTED — Manually sync products from a connected store
+//  PROTECTED — Manually sync all products from a connected store
 // ================================================================
 router.post('/stores/:id/sync', verifyToken, async (req, res) => {
     try {
@@ -305,11 +336,9 @@ router.post('/stores/:id/sync', verifyToken, async (req, res) => {
         if (!store.is_connected || !store.site_url) {
             return res.status(400).json({ error: 'Store is not connected yet' });
         }
-
         const result = await syncProductsFromStore(store);
         res.json({ success: true, ...result });
     } catch (error) {
-        console.error('[WP manual sync] error:', error.message);
         res.status(500).json({ error: 'Sync failed: ' + error.message });
     }
 });
@@ -340,13 +369,15 @@ router.get('/stores/:id/debug', verifyToken, async (req, res) => {
             });
             const firstProduct = prodRes.data.data?.[0] || null;
             result.products_test = {
-                success:           prodRes.data.success,
-                total:             prodRes.data.total,
-                first_product_raw: firstProduct,
-                fields_present:    firstProduct ? Object.keys(firstProduct) : [],
+                success:        prodRes.data.success,
+                total:          prodRes.data.total,
+                first_product:  firstProduct,
+                price:          firstProduct?.price,
+                images_count:   firstProduct?.images?.length ?? 0,
+                categories:     firstProduct?.categories,
             };
         } catch (e) {
-            result.products_test_error = `${e.response?.status || 'network'}: ${e.message} body=${JSON.stringify(e.response?.data)}`;
+            result.products_test_error = `${e.response?.status || 'network'}: ${e.message}`;
         }
 
         res.json(result);
@@ -372,75 +403,7 @@ router.get('/products/categories', verifyToken, async (req, res) => {
 });
 
 // ================================================================
-//  PROTECTED — Upsert a single product by wp_product_id
-// ================================================================
-router.post('/sync-product', verifyToken, async (req, res) => {
-    try {
-        const {
-            wp_store_id, wp_product_id,
-            name, slug, description, short_description,
-            sku, price, regular_price, sale_price,
-            stock_status, stock_quantity,
-            images, categories, tags,
-            status, date_created, currency,
-            site_url, store_name,
-        } = req.body;
-
-        if (!wp_store_id || wp_product_id == null) {
-            return res.status(400).json({ error: 'wp_store_id and wp_product_id are required' });
-        }
-
-        const store = await WordpressStore.findById(wp_store_id);
-        if (!store) return res.status(404).json({ error: 'Store not found' });
-
-        const product = await WordpressProduct.findOneAndUpdate(
-            { wp_store_id: store._id, wp_product_id: Number(wp_product_id) },
-            {
-                $set: {
-                    wp_store_id:       store._id,
-                    site_url:          site_url          || store.site_url,
-                    store_name:        store_name        || store.store_name,
-                    wp_product_id:     Number(wp_product_id),
-                    name:              name              || '',
-                    slug:              slug              || '',
-                    description:       description       || '',
-                    short_description: short_description || '',
-                    sku:               sku               || '',
-                    price:             String(price      ?? '0'),
-                    regular_price:     String(regular_price ?? '0'),
-                    sale_price:        String(sale_price ?? ''),
-                    stock_status:      stock_status      || 'instock',
-                    stock_quantity:    stock_quantity != null ? Number(stock_quantity) : 0,
-                    images:            Array.isArray(images)     ? images     : [],
-                    categories:        Array.isArray(categories) ? categories : [],
-                    tags:              Array.isArray(tags)       ? tags       : [],
-                    status:            status            || 'publish',
-                    date_created:      date_created      || '',
-                    currency:          currency          || 'USD',
-                    synced_at:         new Date(),
-                },
-            },
-            { upsert: true, new: true }
-        );
-
-        // Keep total_products_cached in sync
-        const count = await WordpressProduct.countDocuments({ wp_store_id: store._id });
-        await WordpressStore.updateOne(
-            { _id: store._id },
-            { $set: { total_products_cached: count, last_synced_at: new Date() } }
-        );
-
-        res.json({ success: true, product });
-    } catch (error) {
-        console.error('[sync-product] error:', error.message);
-        res.status(500).json({ error: 'Failed to upsert product: ' + error.message });
-    }
-});
-
-// ================================================================
 //  PROTECTED — Get all synced WordPress products
-//  - Sorted: products with images first
-//  - Supports: search (name + category), category filter, store filter
 // ================================================================
 router.get('/products', verifyToken, async (req, res) => {
     try {
@@ -452,13 +415,11 @@ router.get('/products', verifyToken, async (req, res) => {
             catch (_) { filter.wp_store_id = store_id; }
         }
 
-        // Search in both name and categories.name
         if (search && search.trim()) {
             const regex = { $regex: search.trim(), $options: 'i' };
             filter.$or = [{ name: regex }, { 'categories.name': regex }];
         }
 
-        // Category filter from dropdown
         if (category && category !== 'all') {
             filter['categories.name'] = { $regex: `^${category.trim()}$`, $options: 'i' };
         }
@@ -467,7 +428,6 @@ router.get('/products', verifyToken, async (req, res) => {
         const parsedLimit = Math.min(100, Math.max(1, parseInt(per_page)));
         const skip        = (parsedPage - 1) * parsedLimit;
 
-        // Sort: products with images come first, then by synced_at desc
         const pipeline = [
             { $match: filter },
             { $addFields: { _rank: { $cond: [{ $gt: [{ $size: { $ifNull: ['$images', []] } }, 0] }, 1, 0] } } },
@@ -491,7 +451,6 @@ router.get('/products', verifyToken, async (req, res) => {
             per_page:    parsedLimit,
         });
     } catch (error) {
-        console.error('[WP products] error:', error.message);
         res.status(500).json({ error: 'Failed to fetch products' });
     }
 });
