@@ -35,25 +35,29 @@ const toObjId = (id) => {
 
 // ================================================================
 //  HELPER: Company Store Filter
-//  - super-admin + NO selectedCompanyIds → no filter (see all)
-//  - super-admin + selectedCompanyIds    → filter by those companies' stores
-//  - normal user + allowedStoreIds       → filter by their company stores
-//  - normal user + NO allowedStoreIds    → no filter (backward compat)
+//  "Company" in this app = SellviaDashboard (_id used as company id)
+//  - super-admin + selectedCompanyIds    → filter by sellvia_dashboard_id IN those ids
+//  - super-admin + no filter             → return {} (see all)
+//  - normal user + allowedStoreIds       → filter by store_id
+//  - normal user + no filter             → return {} (backward compat)
 // ================================================================
-const getCompanyStoreFilter = async (req, selectedCompanyIds = []) => {
+const getCompanyStoreFilter = (req, selectedCompanyIds = []) => {
     const isSuperAdmin = req.user.role === 'super-admin' || req.user.role === 'superadmin';
 
     if (isSuperAdmin) {
         if (selectedCompanyIds && selectedCompanyIds.length > 0) {
-            const companyStores = await CompanyStore.find({
-                companyId: { $in: selectedCompanyIds.map(id => toObjId(id)) },
-                isActive:  true,
-            }).lean();
-            const storeIds = [...new Set(companyStores.map(s => String(s.store_id)))];
-            console.log(`[CompanyFilter] SuperAdmin selected ${selectedCompanyIds.length} companies → ${storeIds.length} stores`);
-            if (storeIds.length > 0) return { store_id: { $in: storeIds } };
+            // IDs are SellviaDashboard ObjectIds — filter orders directly by sellvia_dashboard_id
+            const dashObjIds = selectedCompanyIds
+                .map(id => { try { return toObjId(id); } catch (_) { return null; } })
+                .filter(Boolean);
+            if (dashObjIds.length > 0) {
+                console.log(`[CompanyFilter] SuperAdmin → filter by ${dashObjIds.length} dashboards`);
+                return { sellvia_dashboard_id: { $in: dashObjIds } };
+            }
+            // All IDs were invalid — return nothing
+            return { sellvia_dashboard_id: { $in: [] } };
         }
-        console.log('[CompanyFilter] SuperAdmin no company filter → all stores');
+        console.log('[CompanyFilter] SuperAdmin no filter → all orders');
         return {};
     }
 
@@ -208,20 +212,12 @@ const fetchAllOrders = async (store) => {
 //  HELPER: Save orders to MongoDB
 // ================================================================
 const saveOrdersToDatabase = async (dashboardId, store, orders) => {
-    let saved = 0, skipped = 0, errors = 0;
+    let newCount = 0, updatedCount = 0, errors = 0;
     const dashObjId = toObjId(dashboardId);
-
-    const orderIds = orders.map(o => String(o.id)).filter(Boolean);
-    const finalizedOrders = await SellviaOrder.find(
-        { order_id: { $in: orderIds }, status: { $in: ['abandoned', 'shipped'] } },
-        { order_id: 1 }
-    ).lean();
-    const finalizedSet = new Set(finalizedOrders.map(o => o.order_id));
 
     for (const order of orders) {
         if (!order.id) { errors++; continue; }
         const orderId = String(order.id);
-        if (finalizedSet.has(orderId)) { skipped++; continue; }
 
         try {
             const { status, fulfillment } = getOrderStatusAndFulfillment(order);
@@ -251,13 +247,13 @@ const saveOrdersToDatabase = async (dashboardId, store, orders) => {
                 tracking_number: svc.tracking_number || '', tracking_url: svc.tracking_url || '',
                 carrier: svc.carrier || '',
                 date_created: svc.date_created ? new Date(svc.date_created) : null,
-                date_update:  svc.date_update  ? new Date(svc.date_update)  : null,
+                date_update:  (svc.date_updated || svc.date_update) ? new Date(svc.date_updated || svc.date_update) : null,
                 activities: Array.isArray(svc.activities)
                     ? svc.activities.map(a => ({ type: a.type || '', date_created: a.date_created ? new Date(a.date_created) : null, message: a.message || '' }))
                     : [],
             };
 
-            const shi = order.shipping_info || {};
+            const shi = (order.shipping_info && !Array.isArray(order.shipping_info)) ? order.shipping_info : {};
             const shippingInfoObj = { activities: shi.activities || {}, tracking_code: shi.tracking_code || '', carrier: shi.carrier || '', tracking_url: shi.tracking_url || '' };
 
             const act = order.action || {};
@@ -272,12 +268,16 @@ const saveOrdersToDatabase = async (dashboardId, store, orders) => {
                     id: String(p.id || ''), title: p.title || '',
                     quantity: parseInt(p.quantity) || 1, price: String(p.price || ''),
                     price_clear: String(p.price_clear || ''), imageUrl: p.imageUrl || '',
+                    permalink: p.permalink || '',
                     tracking_number: p.tracking_number || '', sku: p.sku || '',
-                    weight: String(p.weight || ''), variation_id: String(p.variation_id || ''), product_id: String(p.product_id || ''),
+                    weight: String(p.weight || ''), variation_id: String(p.variation_id || ''),
+                    product_id: String(p.product_id || ''),
+                    sellvia_post_id: p.sellvia_post_id || 0,
+                    available: parseInt(p.available) || 0,
                 }))
                 : [];
 
-            await SellviaOrder.findOneAndUpdate(
+            const upsertResult = await SellviaOrder.findOneAndUpdate(
                 { order_id: orderId },
                 { $set: {
                     sellvia_dashboard_id: dashObjId, store_id: String(store.store_id),
@@ -300,27 +300,46 @@ const saveOrdersToDatabase = async (dashboardId, store, orders) => {
                     referer: order.referer || '', ip_address: order.ip_address || '',
                     raw: order,
                 }},
-                { upsert: true, new: true }
+                { upsert: true, new: false, rawResult: true }
             );
-            saved++;
+            if (upsertResult.lastErrorObject?.upserted) {
+                newCount++;
+                console.log(`[SYNC] ✦ NEW    order=${orderId} store=${store.store_id} amount=${amount} status=${status} fulfillment=${fulfillment}`);
+            } else {
+                updatedCount++;
+                const old = upsertResult.value;
+                if (old) {
+                    const ch = [];
+                    if ((old.status||'')                              !== status)                              ch.push(`status: "${old.status}"→"${status}"`);
+                    if ((old.fulfillment||'')                         !== fulfillment)                         ch.push(`fulfillment: "${old.fulfillment}"→"${fulfillment}"`);
+                    if (Number(old.amount)                            !== amount)                              ch.push(`amount: ${old.amount}→${amount}`);
+                    if (Number(old.profit)                            !== profit)                              ch.push(`profit: ${old.profit}→${profit}`);
+                    if (Number(old.fee)                               !== fee)                                 ch.push(`fee: ${old.fee}→${fee}`);
+                    if ((old.action?.action||'')                      !== actionObj.action)                    ch.push(`action: "${old.action?.action}"→"${actionObj.action}"`);
+                    if ((old.service_order?.fulfillment||'')          !== serviceOrderObj.fulfillment)         ch.push(`svc_fulfillment: "${old.service_order?.fulfillment}"→"${serviceOrderObj.fulfillment}"`);
+                    if ((old.service_order?.status||'')               !== serviceOrderObj.status)              ch.push(`svc_status: "${old.service_order?.status}"→"${serviceOrderObj.status}"`);
+                    if ((old.service_order?.tracking_number||'')      !== serviceOrderObj.tracking_number)     ch.push(`tracking: "${old.service_order?.tracking_number}"→"${serviceOrderObj.tracking_number}"`);
+                    if (ch.length > 0) console.log(`[SYNC] ✎ UPDATED order=${orderId} store=${store.store_id}: ${ch.join(' | ')}`);
+                }
+            }
         } catch (err) {
             console.error(`[SYNC] Error saving order ${orderId}:`, err.message);
             errors++;
         }
     }
 
-    console.log(`[SYNC] ✓ saved=${saved} skipped=${skipped}(finalized) errors=${errors} store=${store.store_id}`);
+    console.log(`[SYNC] ✓ store=${store.store_id} new=${newCount} updated=${updatedCount} errors=${errors}`);
 
     const AUTO_SYNC_MS_LOCAL = 30 * 60 * 1000;
     const now = new Date();
     try {
         await SellviaStore.updateOne(
             { _id: store._id },
-            { $set: { last_synced_at: now, next_sync_at: new Date(now.getTime() + AUTO_SYNC_MS_LOCAL), total_orders_cached: saved } }
+            { $set: { last_synced_at: now, next_sync_at: new Date(now.getTime() + AUTO_SYNC_MS_LOCAL), total_orders_cached: newCount + updatedCount } }
         );
     } catch (e) { console.warn('[SYNC] Could not update store timestamps:', e.message); }
 
-    return saved;
+    return { newCount, updatedCount };
 };
 
 // ================================================================
@@ -569,8 +588,8 @@ router.post('/sync-store-orders', verifyToken, async (req, res) => {
         store.store_domain = domain;
 
         const result = await fetchAllOrders(store);
-        let savedCount = 0;
-        if (result.orders?.length > 0) savedCount = await saveOrdersToDatabase(result.dashboardId || dashboard_id, store, result.orders);
+        let syncRes = { newCount: 0, updatedCount: 0 };
+        if (result.orders?.length > 0) syncRes = await saveOrdersToDatabase(result.dashboardId || dashboard_id, store, result.orders);
 
         const dashObjId   = toObjId(dashboard_id);
         const storeFilter = { sellvia_dashboard_id: dashObjId, store_id: String(store_id) };
@@ -579,8 +598,8 @@ router.post('/sync-store-orders', verifyToken, async (req, res) => {
         const dbOrders    = await SellviaOrder.find(storeFilter).sort({ order_date: -1 }).skip(skip).limit(parseInt(limit));
         const summary     = await buildSummaryAgg(dashboard_id, { store_id: String(store_id) });
 
-        console.log(`[sync-store-orders] store=${store_id} saved=${savedCount} dbTotal=${dbTotal}`);
-        res.json({ success: true, orders: dbOrders.map(serializeOrder), totalOrders: dbTotal, currentPage: parseInt(page), totalPages: Math.ceil(dbTotal / parseInt(limit)), newOrdersSynced: savedCount, storeDomain: domain, summary });
+        console.log(`[sync-store-orders] store=${store_id} new=${syncRes.newCount} updated=${syncRes.updatedCount} dbTotal=${dbTotal}`);
+        res.json({ success: true, orders: dbOrders.map(serializeOrder), totalOrders: dbTotal, currentPage: parseInt(page), totalPages: Math.ceil(dbTotal / parseInt(limit)), newOrdersSynced: syncRes.newCount, updatedOrders: syncRes.updatedCount, storeDomain: domain, summary });
     } catch (error) {
         console.error('[sync-store-orders] error:', error);
         res.status(500).json({ error: error.message });
@@ -610,14 +629,17 @@ router.post('/sync-all-stores-orders', verifyToken, async (req, res) => {
                 const domain = await getStoreDomain(store);
                 store.store_domain = domain;
                 const result = await fetchAllOrders(store);
-                let savedCount = 0;
-                if (result.orders?.length > 0) savedCount = await saveOrdersToDatabase(dashboard_id, store, result.orders);
-                totalSynced += savedCount;
-                results.push({ store_id: store.store_id, synced: savedCount, total: result.total || 0 });
-                console.log(`[sync-all] ✓ store=${store.store_id} saved=${savedCount}`);
+                let storeNew = 0, storeUpdated = 0;
+                if (result.orders?.length > 0) {
+                    const syncRes = await saveOrdersToDatabase(dashboard_id, store, result.orders);
+                    storeNew = syncRes.newCount; storeUpdated = syncRes.updatedCount;
+                }
+                totalSynced += storeNew + storeUpdated;
+                results.push({ store_id: store.store_id, store_name: store.store_name || store.store_domain || store.store_id, newOrders: storeNew, updatedOrders: storeUpdated, totalFetched: result.total || 0 });
+                console.log(`[sync-all] ✓ store=${store.store_id} new=${storeNew} updated=${storeUpdated}`);
             } catch (storeErr) {
                 console.error(`[sync-all] store=${store.store_id} error:`, storeErr.message);
-                results.push({ store_id: store.store_id, synced: 0, error: storeErr.message });
+                results.push({ store_id: store.store_id, store_name: store.store_name || store.store_id, newOrders: 0, updatedOrders: 0, error: storeErr.message });
             }
         }
 
@@ -833,13 +855,12 @@ router.get('/all-stores-superadmin', verifyToken, async (req, res) => {
 
         if (selectedCompanyIds) {
             try {
-                const companyIdList  = selectedCompanyIds.split(',').filter(Boolean);
+                const companyIdList = selectedCompanyIds.split(',').filter(Boolean);
                 if (companyIdList.length > 0) {
-                    const companyObjIds  = companyIdList.map(id => { try { return toObjId(id); } catch (_) { return null; } }).filter(Boolean);
-                    const companyStores  = await CompanyStore.find({ companyId: { $in: companyObjIds }, isActive: true }).lean();
-                    const storeIds       = companyStores.map(s => String(s.store_id));
-                    stores               = await SellviaStore.find({ store_id: { $in: storeIds } }).sort({ store_name: 1 });
-                    console.log(`[all-stores-superadmin] company filter: ${companyIdList.length} companies → ${stores.length} stores`);
+                    // IDs are dashboard _ids (company-stores API returns dashboards as companies)
+                    const dashObjIds = companyIdList.map(id => { try { return toObjId(id); } catch (_) { return null; } }).filter(Boolean);
+                    stores = await SellviaStore.find({ sellvia_dashboard_id: { $in: dashObjIds } }).sort({ store_name: 1 });
+                    console.log(`[all-stores-superadmin] dashboard filter: ${companyIdList.length} dashboards → ${stores.length} stores`);
                 } else {
                     stores = await SellviaStore.find({}).sort({ store_name: 1 });
                 }
@@ -1136,6 +1157,59 @@ router.get('/home-stores/:dashboard_id', verifyToken, async (req, res) => {
 });
 
 // ================================================================
+//  POST /sync-all-dashboards-superadmin
+//  Super-admin "Sync Now" — syncs every dashboard + store, returns
+//  per-company / per-store breakdown of new vs updated orders
+// ================================================================
+router.post('/sync-all-dashboards-superadmin', verifyToken, async (req, res) => {
+    try {
+        const isSA = req.user.role === 'super-admin' || req.user.role === 'superadmin';
+        if (!isSA) return res.status(403).json({ error: 'Forbidden: super-admin only' });
+
+        const dashboards = await SellviaDashboard.find({});
+        if (!dashboards.length) return res.json({ success: true, companies: [], grandTotal: { newOrders: 0, updatedOrders: 0 } });
+
+        let grandNew = 0, grandUpdated = 0;
+        const companies = [];
+
+        for (const dashboard of dashboards) {
+            const stores = await SellviaStore.find({ sellvia_dashboard_id: dashboard._id }).sort({ store_name: 1 });
+            let companyNew = 0, companyUpdated = 0;
+            const storeResults = [];
+
+            for (const store of stores) {
+                try {
+                    const domain = await getStoreDomain(store);
+                    store.store_domain = domain;
+                    const fetchResult = await fetchAllOrders(store);
+                    let sNew = 0, sUpd = 0;
+                    if (fetchResult.success && fetchResult.orders?.length > 0) {
+                        const syncRes = await saveOrdersToDatabase(String(dashboard._id), store, fetchResult.orders);
+                        sNew = syncRes.newCount; sUpd = syncRes.updatedCount;
+                    }
+                    companyNew += sNew; companyUpdated += sUpd;
+                    storeResults.push({ store_id: store.store_id, store_name: store.store_name || store.store_domain || store.store_id, newOrders: sNew, updatedOrders: sUpd, totalFetched: fetchResult.total || 0 });
+                    console.log(`[SyncNow] ✓ company="${dashboard.dashboard_name}" store=${store.store_id}(${store.store_name||store.store_domain}) new=${sNew} updated=${sUpd}`);
+                } catch (storeErr) {
+                    console.error(`[SyncNow] store=${store.store_id} error:`, storeErr.message);
+                    storeResults.push({ store_id: store.store_id, store_name: store.store_name || store.store_id, newOrders: 0, updatedOrders: 0, error: storeErr.message });
+                }
+            }
+
+            grandNew += companyNew; grandUpdated += companyUpdated;
+            companies.push({ company_id: String(dashboard._id), company_name: dashboard.dashboard_name, newOrders: companyNew, updatedOrders: companyUpdated, stores: storeResults });
+            console.log(`[SyncNow] Company "${dashboard.dashboard_name}" — new=${companyNew} updated=${companyUpdated}`);
+        }
+
+        console.log(`[SyncNow] DONE grandNew=${grandNew} grandUpdated=${grandUpdated}`);
+        res.json({ success: true, grandTotal: { newOrders: grandNew, updatedOrders: grandUpdated }, companies });
+    } catch (error) {
+        console.error('[sync-all-dashboards-superadmin] error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// ================================================================
 //  AUTO-SCHEDULER: sync all stores every 30 minutes
 // ================================================================
 const AUTO_SYNC_MS = 30 * 60 * 1000;
@@ -1166,13 +1240,12 @@ const autoSyncAllDashboards = async () => {
                         store.store_domain = domain;
                         const result = await fetchAllOrders(store);
                         if (!result.success || !result.orders?.length) { console.log(`[AutoSync] No orders for store=${store.store_id}`); continue; }
-                        const saved = await saveOrdersToDatabase(String(dashboard._id), store, result.orders);
-                        totalSynced += saved;
-                        // Update last_synced_at and total_orders_cached on the store document
+                        const syncRes = await saveOrdersToDatabase(String(dashboard._id), store, result.orders);
+                        totalSynced += syncRes.newCount + syncRes.updatedCount;
                         await SellviaStore.findByIdAndUpdate(store._id, {
-                            $set: { last_synced_at: new Date(), total_orders_cached: (store.total_orders_cached || 0) + saved },
+                            $set: { last_synced_at: new Date(), total_orders_cached: syncRes.newCount + syncRes.updatedCount },
                         });
-                        console.log(`[AutoSync] ✓ dash=${dashboard._id} store=${store.store_id} saved=${saved}`);
+                        console.log(`[AutoSync] ✓ dash=${dashboard._id} store=${store.store_id} new=${syncRes.newCount} updated=${syncRes.updatedCount}`);
                     } catch (storeErr) { console.error(`[AutoSync] store=${store.store_id} error:`, storeErr.message); }
                 }
                 console.log(`[AutoSync] Dashboard ${dashboard._id} done. totalSynced=${totalSynced}`);

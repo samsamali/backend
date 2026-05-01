@@ -14,7 +14,10 @@ const userSchema = new mongoose.Schema({
   city: { type: String, default: null },
   state: { type: String, default: null },
   country: { type: String, default: null },
-  isActive: { type: Boolean, default: false }
+  isActive:       { type: Boolean, default: false },
+  googleId:       { type: String,  default: null },
+  resetOTP:       { type: String,  default: null },
+  resetOTPExpiry: { type: Date,    default: null },
 });
 
 module.exports = mongoose.model("User", userSchema);

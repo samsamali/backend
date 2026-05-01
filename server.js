@@ -1,6 +1,8 @@
+const dotenv = require('dotenv');
+dotenv.config();
+
 const express = require('express');
 const mongoose = require('mongoose');
-const dotenv = require('dotenv');
 const cors = require('cors');
 const path = require('path');
 const fileUpload = require('express-fileupload'); // Add this line
@@ -23,9 +25,6 @@ const companyStoreRoutes = require('./modules/admin/routes/companyStoreRoutes');
 // const dns = require('dns');
 // // Force reliable DNS servers (Cloudflare and Google)
 // dns.setServers(['1.1.1.1', '8.8.8.8', '1.0.0.1', '8.8.4.4']);
-
-// Load environment variables
-dotenv.config();
 
 const app = express();
 

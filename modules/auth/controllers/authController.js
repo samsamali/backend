@@ -1,6 +1,9 @@
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
 const User = require("../models/User");
+const { sendOTPEmail, sendNotRegisteredEmail } = require("../utils/email");
+const { OAuth2Client } = require("google-auth-library");
+const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
 const Role = require("../../../modules/role/models/Role");
 const Group = require("../../../modules/admin/models/Group");
 const UserRole = require("../../../modules/role/models/user-roles");
@@ -466,10 +469,11 @@ exports.login = async (req, res) => {
       token,
       expiresIn:       3600,
       user: {
-        _id:      user._id,
-        name:     user.name,
-        email:    user.email,
-        isActive: user.isActive,
+        _id:            user._id,
+        name:           user.name,
+        email:          user.email,
+        isActive:       user.isActive,
+        profilePicture: user.profilePicture || null,
       },
       role:            userRoleDoc.roleName,
       roleId:          userRoleDoc.roleId._id,
@@ -1012,5 +1016,324 @@ exports.verifyToken = async (req, res) => {
   } catch (error) {
     console.error("Token verification error:", error);
     res.status(401).json({ message: "Invalid or expired token. Please log in again." });
+  }
+};
+// ===================== FORGOT PASSWORD – SEND OTP =====================
+exports.forgotPassword = async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!email) return res.status(400).json({ message: "Email is required." });
+    const clean = email.toLowerCase().trim();
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(clean))
+      return res.status(400).json({ message: "Please enter a valid email address." });
+
+    const user = await User.findOne({ email: clean });
+
+    if (!user) {
+      // Send a "not registered" notice to the email — always deliver something
+      try { await sendNotRegisteredEmail(clean); } catch (_) {}
+      return res.status(200).json({ message: "OTP sent to your email address." });
+    }
+
+    const otp = Math.floor(100000 + Math.random() * 900000).toString();
+    user.resetOTP = otp;
+    user.resetOTPExpiry = new Date(Date.now() + 10 * 60 * 1000);
+    await user.save();
+    await sendOTPEmail(clean, otp);
+
+    return res.status(200).json({ message: "OTP sent to your email address." });
+  } catch (err) {
+    console.error("forgotPassword error:", err);
+    return res.status(500).json({ message: "Failed to send OTP. Please try again." });
+  }
+};
+
+// ===================== VERIFY OTP =====================
+exports.verifyOTP = async (req, res) => {
+  try {
+    const { email, otp } = req.body;
+    if (!email || !otp) return res.status(400).json({ message: "Email and OTP are required." });
+
+    const user = await User.findOne({ email: email.toLowerCase().trim() });
+    if (!user || !user.resetOTP) return res.status(400).json({ message: "Invalid or expired OTP." });
+    if (new Date() > user.resetOTPExpiry) return res.status(400).json({ message: "OTP has expired. Please request a new one." });
+    if (user.resetOTP !== otp.trim()) return res.status(400).json({ message: "Incorrect OTP. Please try again." });
+
+    return res.status(200).json({ message: "OTP verified successfully." });
+  } catch (err) {
+    console.error("verifyOTP error:", err);
+    return res.status(500).json({ message: "Verification failed. Please try again." });
+  }
+};
+
+// ===================== RESET PASSWORD =====================
+exports.resetPassword = async (req, res) => {
+  try {
+    const { email, otp, newPassword } = req.body;
+    if (!email || !otp || !newPassword) return res.status(400).json({ message: "Email, OTP, and new password are required." });
+    if (newPassword.length < 6) return res.status(400).json({ message: "Password must be at least 6 characters." });
+
+    const clean = email.toLowerCase().trim();
+    const user = await User.findOne({ email: clean });
+    if (!user || !user.resetOTP) return res.status(400).json({ message: "Invalid or expired OTP." });
+    if (new Date() > user.resetOTPExpiry) return res.status(400).json({ message: "OTP has expired. Please request a new one." });
+    if (user.resetOTP !== otp.trim()) return res.status(400).json({ message: "Incorrect OTP." });
+
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+
+    // Use direct DB update to guarantee the write goes through
+    const result = await User.updateOne(
+      { _id: user._id },
+      { $set: { password: hashedPassword, resetOTP: null, resetOTPExpiry: null } }
+    );
+
+    if (result.modifiedCount === 0) {
+      return res.status(500).json({ message: "Failed to update password. Please try again." });
+    }
+
+    return res.status(200).json({ message: "Password updated successfully. You can now log in." });
+  } catch (err) {
+    console.error("resetPassword error:", err);
+    return res.status(500).json({ message: "Reset failed. Please try again." });
+  }
+};
+
+// ══════════════════════════════════════════════════════════════════
+//  SHARED SOCIAL AUTH HELPERS
+// ══════════════════════════════════════════════════════════════════
+
+/* Builds JWT + full response payload for any social OAuth provider */
+async function handleSocialUser({ email, name, picture, mode }) {
+  const clean = email.toLowerCase().trim();
+  let user = await User.findOne({ email: clean });
+  let isNewUser = false;
+
+  if (!user) {
+    if (mode === "login") {
+      return { __error: "No account found with this email. Please sign up first." };
+    }
+    isNewUser = true;
+    const randomPwd = await bcrypt.hash(Math.random().toString(36) + Date.now().toString(), 10);
+    user = await User.create({
+      name: name || clean.split("@")[0],
+      email: clean,
+      password: randomPwd,
+      profilePicture: picture || "",
+      isActive: true,
+      trialStartDate: new Date(),
+    });
+    const customerRole = await Role.findOne({ name: "Customer" });
+    if (!customerRole) throw new Error("Default Customer role not found.");
+    await UserRole.create({ userId: user._id, roleId: customerRole._id, roleName: customerRole.name });
+    let trialGroup = await Group.findOne({ groupName: "Trial Group" });
+    if (!trialGroup) trialGroup = await Group.create({ groupName: "Trial Group", description: "Default trial group", isActive: true });
+    await UserGroup.create({ userId: user._id, groupId: trialGroup._id, groupName: trialGroup.groupName });
+  }
+
+  const userRoleDoc = await UserRole.findOne({ userId: user._id }).populate("roleId");
+  if (!userRoleDoc) throw new Error("No role assigned to this account.");
+  if (userRoleDoc.roleName.toLowerCase() !== "customer")
+    return { __error: "Only Customer accounts can use social login here." };
+
+  let userModules = [];
+  const rolePermissions = await RolePermission.find({ roleId: userRoleDoc.roleId._id, is_active: true })
+    .populate({ path: "modulePermissionId", populate: [{ path: "moduleId" }, { path: "permissionId" }] });
+  for (const rp of rolePermissions) {
+    const mp = rp.modulePermissionId;
+    if (mp && mp.is_active && mp.moduleId && mp.moduleId.is_active && mp.permissionId) {
+      let mod = userModules.find(m => m.moduleId.toString() === mp.moduleId._id.toString());
+      if (!mod) {
+        mod = { moduleId: mp.moduleId._id, name: mp.moduleId.name, route_path: mp.moduleId.route_path, icon: mp.moduleId.icon, order: mp.moduleId.order, is_category: mp.moduleId.is_category, parent_id: mp.moduleId.parent_id, is_active: mp.moduleId.is_active, permissions: [] };
+        userModules.push(mod);
+      }
+      if (!mod.permissions.includes(mp.permissionId.code)) mod.permissions.push(mp.permissionId.code);
+    }
+  }
+
+  const userGroup = await UserGroup.findOne({ userId: user._id }).populate("groupId");
+  let group = null, groupPermissions = [], isTrial = false;
+  if (userGroup?.groupId) {
+    group = { _id: userGroup.groupId._id, name: userGroup.groupId.groupName || userGroup.groupId.name };
+    if (group.name?.toLowerCase().includes("trial")) isTrial = true;
+    const gpDoc = await GroupPermission.findOne({ groupId: userGroup.groupId._id });
+    if (gpDoc?.permissions) {
+      groupPermissions = gpDoc.permissions.filter(p => p.isActive !== false)
+        .map(p => ({ permissionId: p.permissionId, permissionCode: p.permissionCode }));
+    }
+  }
+
+  let subscription = null;
+  const userSub = await UserSubscription.findOne({ userId: user._id }).populate("subscriptionId");
+  if (userSub) { if (userSub.isTrial) isTrial = true; subscription = userSub.subscriptionId; }
+
+  const groupPermCodes = groupPermissions.map(p => p.permissionCode);
+  const filteredModules = userModules.map(m => ({
+    ...m, permissions: m.permissions.filter(c => groupPermCodes.includes(c) || groupPermCodes.length === 0),
+  }));
+
+  const token = jwt.sign(
+    { userId: user._id, role: userRoleDoc.roleName, roleId: userRoleDoc.roleId._id, modules: filteredModules },
+    process.env.JWT_SECRET, { expiresIn: "1h" }
+  );
+
+  return {
+    success: true,
+    message: isNewUser ? "Account created successfully." : "Login successful.",
+    token, expiresIn: 3600,
+    user: { _id: user._id, name: user.name, email: user.email, profilePicture: user.profilePicture || "", isActive: user.isActive },
+    modules: filteredModules,
+    group: { ...group, permissions: groupPermissions },
+    subscription, isTrial,
+    role: userRoleDoc.roleName,
+    roleId: userRoleDoc.roleId._id,
+    permissions: groupPermissions,
+  };
+}
+
+/* Sends OAuth result back to the opener popup window */
+function sendOAuthPopupResult(res, data) {
+  const frontendUrl = process.env.FRONTEND_URL || "http://localhost:3000";
+  const safeData = JSON.stringify(data).replace(/</g, "\\u003c");
+  res.setHeader("Content-Type", "text/html");
+  res.send(`<!DOCTYPE html><html><head><title>Auth</title></head><body><script>
+(function(){
+  var payload = ${safeData};
+  payload.type = 'SOCIAL_AUTH_SUCCESS';
+  if(window.opener && !window.opener.closed){
+    window.opener.postMessage(payload, '${frontendUrl}');
+    setTimeout(function(){ window.close(); }, 300);
+  } else {
+    window.location.href = '${frontendUrl}';
+  }
+})();
+</script></body></html>`);
+}
+
+// ===================== GOOGLE LOGIN / SIGNUP =====================
+exports.googleLogin = async (req, res) => {
+  try {
+    const { credential, access_token, mode } = req.body;
+    if (!credential && !access_token) return res.status(400).json({ message: "Google credential is required." });
+
+    let email, name, picture;
+
+    if (credential) {
+      // ID-token flow (legacy GoogleLogin component)
+      const ticket = await googleClient.verifyIdToken({ idToken: credential, audience: process.env.GOOGLE_CLIENT_ID });
+      ({ email, name, picture } = ticket.getPayload());
+    } else {
+      // Access-token flow (useGoogleLogin hook → icon button)
+      const infoRes = await fetch("https://www.googleapis.com/oauth2/v3/userinfo", {
+        headers: { Authorization: `Bearer ${access_token}` },
+      });
+      const info = await infoRes.json();
+      if (info.error) return res.status(401).json({ message: "Invalid Google token." });
+      ({ email, name, picture } = info);
+    }
+
+    const result = await handleSocialUser({ email, name, picture, mode });
+    if (result.__error) return res.status(404).json({ message: result.__error });
+    return res.status(200).json(result);
+
+  } catch (err) {
+    console.error("googleLogin error:", err.message);
+    return res.status(500).json({ message: "Google authentication failed. Please try again." });
+  }
+};
+
+// ===================== FACEBOOK LOGIN / SIGNUP =====================
+exports.facebookLogin = (req, res) => {
+  const { mode = "login" } = req.query;
+  const state = Buffer.from(JSON.stringify({ mode })).toString("base64url");
+  const params = new URLSearchParams({
+    client_id: process.env.FACEBOOK_APP_ID,
+    redirect_uri: process.env.FACEBOOK_CALLBACK_URL,
+    scope: "email,public_profile",
+    state,
+    response_type: "code",
+  });
+  res.redirect(`https://www.facebook.com/v19.0/dialog/oauth?${params}`);
+};
+
+exports.facebookCallback = async (req, res) => {
+  try {
+    const { code, state, error } = req.query;
+    if (error) return sendOAuthPopupResult(res, { __error: "Facebook sign-in was cancelled." });
+
+    const { mode } = JSON.parse(Buffer.from(state, "base64url").toString());
+
+    // Exchange code for access token
+    const tokenParams = new URLSearchParams({
+      client_id: process.env.FACEBOOK_APP_ID,
+      client_secret: process.env.FACEBOOK_APP_SECRET,
+      redirect_uri: process.env.FACEBOOK_CALLBACK_URL,
+      code,
+    });
+    const tokenRes = await fetch(`https://graph.facebook.com/v19.0/oauth/access_token?${tokenParams}`);
+    const tokenData = await tokenRes.json();
+    if (tokenData.error) throw new Error(tokenData.error.message);
+
+    // Get user info from Facebook
+    const userRes = await fetch(`https://graph.facebook.com/v19.0/me?fields=id,name,email,picture.type(large)&access_token=${tokenData.access_token}`);
+    const fbUser = await userRes.json();
+    if (!fbUser.email) throw new Error("Facebook account has no public email. Please use a different sign-in method.");
+
+    const result = await handleSocialUser({ email: fbUser.email, name: fbUser.name, picture: fbUser.picture?.data?.url, mode });
+    sendOAuthPopupResult(res, result);
+  } catch (err) {
+    console.error("facebookCallback error:", err.message);
+    sendOAuthPopupResult(res, { __error: err.message || "Facebook authentication failed." });
+  }
+};
+
+// ===================== GITHUB LOGIN / SIGNUP =====================
+exports.githubLogin = (req, res) => {
+  const { mode = "login" } = req.query;
+  const state = Buffer.from(JSON.stringify({ mode })).toString("base64url");
+  const params = new URLSearchParams({
+    client_id: process.env.GITHUB_CLIENT_ID,
+    redirect_uri: process.env.GITHUB_CALLBACK_URL,
+    scope: "user:email",
+    state,
+  });
+  res.redirect(`https://github.com/login/oauth/authorize?${params}`);
+};
+
+exports.githubCallback = async (req, res) => {
+  try {
+    const { code, state, error } = req.query;
+    if (error) return sendOAuthPopupResult(res, { __error: "GitHub sign-in was cancelled." });
+
+    const { mode } = JSON.parse(Buffer.from(state, "base64url").toString());
+
+    // Exchange code for access token
+    const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
+      method: "POST",
+      headers: { Accept: "application/json", "Content-Type": "application/json" },
+      body: JSON.stringify({ client_id: process.env.GITHUB_CLIENT_ID, client_secret: process.env.GITHUB_CLIENT_SECRET, code }),
+    });
+    const tokenData = await tokenRes.json();
+    if (tokenData.error) throw new Error(tokenData.error_description || tokenData.error);
+
+    const ghHeaders = { Authorization: `Bearer ${tokenData.access_token}`, Accept: "application/vnd.github+json" };
+
+    // Get user profile
+    const userRes = await fetch("https://api.github.com/user", { headers: ghHeaders });
+    const ghUser = await userRes.json();
+
+    // GitHub may hide email — fetch from /user/emails
+    let email = ghUser.email;
+    if (!email) {
+      const emailsRes = await fetch("https://api.github.com/user/emails", { headers: ghHeaders });
+      const emails = await emailsRes.json();
+      email = emails.find(e => e.primary && e.verified)?.email || emails[0]?.email;
+    }
+    if (!email) throw new Error("Could not get email from GitHub account. Make sure your email is public or verified.");
+
+    const result = await handleSocialUser({ email, name: ghUser.name || ghUser.login, picture: ghUser.avatar_url, mode });
+    sendOAuthPopupResult(res, result);
+  } catch (err) {
+    console.error("githubCallback error:", err.message);
+    sendOAuthPopupResult(res, { __error: err.message || "GitHub authentication failed." });
   }
 };
