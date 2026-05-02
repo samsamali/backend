@@ -443,21 +443,33 @@ router.delete('/products/:productId/remove/:storeId', verifyToken, async (req, r
         if (!product) return res.status(404).json({ error: 'Product not found' });
         if (!store)   return res.status(404).json({ error: 'Store not found' });
 
-        // Try to delete from actual WordPress site via plugin
+        // Delete from actual WordPress site via plugin
         let wpDeleted = false;
+        let wpError   = null;
         if (store.site_url && store.token) {
+            const wpUrl = `${store.site_url.replace(/\/$/, '')}/wp-json/marketsync/v1/products/${product.wp_product_id}`;
+            console.log(`[remove-product] Calling WP DELETE → ${wpUrl}`);
             try {
-                await axios.delete(
-                    `${store.site_url.replace(/\/$/, '')}/wp-json/marketsync/v1/products/${product.wp_product_id}`,
-                    { headers: { 'X-Marketsync-Token': store.token }, timeout: 15000 }
-                );
+                const wpRes = await axios.delete(wpUrl, {
+                    headers: { 'X-Marketsync-Token': store.token },
+                    timeout: 15000,
+                });
+                console.log(`[remove-product] WP response:`, JSON.stringify(wpRes.data));
                 wpDeleted = true;
             } catch (wpErr) {
-                console.warn(`[remove-product] WP delete failed (store=${store.store_name}): ${wpErr.message}`);
+                wpError = wpErr.response?.data || wpErr.message;
+                console.error(`[remove-product] WP DELETE failed → status=${wpErr.response?.status} body=${JSON.stringify(wpErr.response?.data)} msg=${wpErr.message}`);
             }
         }
 
-        // Always remove from MongoDB regardless of WP result
+        if (!wpDeleted) {
+            return res.status(502).json({
+                error: `WordPress delete failed: ${typeof wpError === 'object' ? JSON.stringify(wpError) : wpError}`,
+                wp_error: wpError,
+            });
+        }
+
+        // Remove from MongoDB only after successful WP deletion
         await WordpressProduct.findOneAndDelete({
             wp_store_id:   store._id,
             wp_product_id: product.wp_product_id,
@@ -466,7 +478,7 @@ router.delete('/products/:productId/remove/:storeId', verifyToken, async (req, r
         const count = await WordpressProduct.countDocuments({ wp_store_id: store._id });
         await WordpressStore.updateOne({ _id: store._id }, { $set: { total_products_cached: count } });
 
-        res.json({ success: true, wp_deleted: wpDeleted });
+        res.json({ success: true, wp_deleted: true });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
