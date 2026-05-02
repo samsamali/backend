@@ -470,9 +470,15 @@ router.delete('/products/:productId/remove/:storeId', verifyToken, async (req, r
                 console.log(`[remove-product] WP response:`, JSON.stringify(wpRes.data));
                 wpDeleted = true;
             } catch (wpErr) {
+                const status = wpErr.response?.status;
                 wpError = wpErr.response?.data || wpErr.message;
-                console.error(`[remove-product] WP DELETE failed → status=${wpErr.response?.status} body=${JSON.stringify(wpErr.response?.data)} msg=${wpErr.message}`);
+                console.error(`[remove-product] WP DELETE failed → status=${status} body=${JSON.stringify(wpErr.response?.data)} msg=${wpErr.message}`);
+                // 404 means product already doesn't exist on WP — treat as deleted
+                if (status === 404) wpDeleted = true;
             }
+        } else {
+            // No WP connection info — just remove from MongoDB
+            wpDeleted = true;
         }
 
         if (!wpDeleted) {
