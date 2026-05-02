@@ -442,12 +442,16 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
                 if (wpRes.data?.id) finalWpProductId = wpRes.data.id;
                 wpPushed = true;
             } catch (wpErr) {
+                const status = wpErr.response?.status;
                 wpError = wpErr.response?.data || wpErr.message;
-                console.error(`[assign-product] WP PUT failed → status=${wpErr.response?.status} body=${JSON.stringify(wpErr.response?.data)} msg=${wpErr.message}`);
-                return res.status(502).json({
-                    error: `WordPress add failed: ${typeof wpError === 'object' ? JSON.stringify(wpError) : wpError}`,
-                    wp_error: wpError,
-                });
+                console.error(`[assign-product] WP PUT failed → status=${status} body=${JSON.stringify(wpErr.response?.data)} msg=${wpErr.message}`);
+                // 404 = product doesn't exist on target WP yet — skip WP, still save to MongoDB
+                if (status !== 404) {
+                    return res.status(502).json({
+                        error: `WordPress add failed: ${typeof wpError === 'object' ? JSON.stringify(wpError) : wpError}`,
+                        wp_error: wpError,
+                    });
+                }
             }
         }
 
