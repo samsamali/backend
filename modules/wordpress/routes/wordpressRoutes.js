@@ -405,14 +405,61 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
         if (!product)     return res.status(404).json({ error: 'Product not found' });
         if (!targetStore) return res.status(404).json({ error: 'Store not found' });
 
+        let wpPushed = false;
+        let wpError  = null;
+        let finalWpProductId = product.wp_product_id;
+
+        // Push to WordPress store first (if connected)
+        if (targetStore.site_url && targetStore.token && targetStore.is_connected) {
+            const baseUrl = targetStore.site_url.replace(/\/$/, '');
+            const wpUrl   = `${baseUrl}/wp-json/marketsync/v1/products/${product.wp_product_id}`;
+            const payload = {
+                id:                product.wp_product_id,
+                name:              product.name,
+                slug:              product.slug,
+                description:       product.description,
+                short_description: product.short_description,
+                sku:               product.sku,
+                price:             product.price,
+                regular_price:     product.regular_price,
+                sale_price:        product.sale_price,
+                stock_status:      product.stock_status,
+                stock_quantity:    product.stock_quantity,
+                images:            product.images?.map(img => ({ id: img.id, src: img.src, alt: img.alt })) || [],
+                categories:        product.categories?.map(c => ({ id: c.id, name: c.name, slug: c.slug })) || [],
+                tags:              product.tags?.map(t => ({ id: t.id, name: t.name })) || [],
+                status:            product.status || 'publish',
+                currency:          product.currency || 'USD',
+            };
+
+            console.log(`[assign-product] Calling WP PUT → ${wpUrl}`);
+            try {
+                const wpRes = await axios.put(wpUrl, payload, {
+                    headers: { 'X-Marketsync-Token': targetStore.token },
+                    timeout: 15000,
+                });
+                console.log(`[assign-product] WP response:`, JSON.stringify(wpRes.data));
+                if (wpRes.data?.id) finalWpProductId = wpRes.data.id;
+                wpPushed = true;
+            } catch (wpErr) {
+                wpError = wpErr.response?.data || wpErr.message;
+                console.error(`[assign-product] WP PUT failed → status=${wpErr.response?.status} body=${JSON.stringify(wpErr.response?.data)} msg=${wpErr.message}`);
+                return res.status(502).json({
+                    error: `WordPress add failed: ${typeof wpError === 'object' ? JSON.stringify(wpError) : wpError}`,
+                    wp_error: wpError,
+                });
+            }
+        }
+
+        // Save to MongoDB only after successful WP push
         const saved = await WordpressProduct.findOneAndUpdate(
-            { wp_store_id: targetStore._id, wp_product_id: product.wp_product_id },
+            { wp_store_id: targetStore._id, wp_product_id: finalWpProductId },
             {
                 $set: {
                     wp_store_id:       targetStore._id,
                     site_url:          targetStore.site_url,
                     store_name:        targetStore.store_name,
-                    wp_product_id:     product.wp_product_id,
+                    wp_product_id:     finalWpProductId,
                     name:              product.name,
                     slug:              product.slug,
                     description:       product.description,
@@ -438,7 +485,7 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
         const count = await WordpressProduct.countDocuments({ wp_store_id: targetStore._id });
         await WordpressStore.updateOne({ _id: targetStore._id }, { $set: { total_products_cached: count } });
 
-        res.json({ success: true, product: saved });
+        res.json({ success: true, product: saved, wp_pushed: wpPushed });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
