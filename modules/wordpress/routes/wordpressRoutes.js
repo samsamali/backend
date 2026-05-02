@@ -432,21 +432,57 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
                 currency:          product.currency || 'USD',
             };
 
+            // Try PUT first (update if exists), fall back to POST (create new)
             console.log(`[assign-product] Calling WP PUT → ${wpUrl}`);
             try {
                 const wpRes = await axios.put(wpUrl, payload, {
                     headers: { 'X-Marketsync-Token': targetStore.token },
                     timeout: 15000,
                 });
-                console.log(`[assign-product] WP response:`, JSON.stringify(wpRes.data));
-                if (wpRes.data?.id) finalWpProductId = wpRes.data.id;
+                console.log(`[assign-product] WP PUT success:`, wpRes.data?.data?.id || wpRes.data?.id);
+                const returnedId = wpRes.data?.data?.id || wpRes.data?.id;
+                if (returnedId) finalWpProductId = returnedId;
                 wpPushed = true;
             } catch (wpErr) {
                 const status = wpErr.response?.status;
                 wpError = wpErr.response?.data || wpErr.message;
-                console.error(`[assign-product] WP PUT failed → status=${status} body=${JSON.stringify(wpErr.response?.data)} msg=${wpErr.message}`);
-                // 404 = product doesn't exist on target WP yet — skip WP, still save to MongoDB
-                if (status !== 404) {
+                console.error(`[assign-product] WP PUT failed → status=${status}`);
+
+                if (status === 404) {
+                    // Product doesn't exist on target store — create it via POST
+                    const postUrl     = `${baseUrl}/wp-json/marketsync/v1/products`;
+                    const postPayload = {
+                        name:              product.name,
+                        description:       product.description,
+                        short_description: product.short_description,
+                        price:             product.price,
+                        regular_price:     product.regular_price,
+                        sale_price:        product.sale_price,
+                        sku:               product.sku,
+                        stock_status:      product.stock_status,
+                        stock_quantity:    product.stock_quantity,
+                        image_url:         product.images?.[0]?.src || '',
+                        categories:        product.categories?.map(c => c.name) || [],
+                    };
+                    console.log(`[assign-product] Calling WP POST → ${postUrl}`);
+                    try {
+                        const postRes = await axios.post(postUrl, postPayload, {
+                            headers: { 'X-Marketsync-Token': targetStore.token },
+                            timeout: 15000,
+                        });
+                        console.log(`[assign-product] WP POST success:`, postRes.data?.data?.id);
+                        const newId = postRes.data?.data?.id;
+                        if (newId) finalWpProductId = newId;
+                        wpPushed = true;
+                    } catch (postErr) {
+                        const postError = postErr.response?.data || postErr.message;
+                        console.error(`[assign-product] WP POST failed:`, JSON.stringify(postError));
+                        return res.status(502).json({
+                            error: `WordPress create failed: ${typeof postError === 'object' ? JSON.stringify(postError) : postError}`,
+                            wp_error: postError,
+                        });
+                    }
+                } else {
                     return res.status(502).json({
                         error: `WordPress add failed: ${typeof wpError === 'object' ? JSON.stringify(wpError) : wpError}`,
                         wp_error: wpError,
