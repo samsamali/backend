@@ -302,7 +302,7 @@ const saveOrdersToDatabase = async (dashboardId, store, orders) => {
                 }},
                 { upsert: true, new: false, rawResult: true }
             );
-            if (upsertResult.lastErrorObject?.upserted) {
+            if (upsertResult?.lastErrorObject?.upserted) {
                 newCount++;
                 console.log(`[SYNC] ✦ NEW    order=${orderId} store=${store.store_id} amount=${amount} status=${status} fulfillment=${fulfillment}`);
             } else {

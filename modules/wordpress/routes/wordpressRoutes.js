@@ -405,18 +405,31 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
         if (!product)     return res.status(404).json({ error: 'Product not found' });
         if (!targetStore) return res.status(404).json({ error: 'Store not found' });
 
-        const data = product.toObject();
-        delete data._id; delete data.__v; delete data.created_at; delete data.updated_at;
-
         const saved = await WordpressProduct.findOneAndUpdate(
             { wp_store_id: targetStore._id, wp_product_id: product.wp_product_id },
             {
                 $set: {
-                    ...data,
-                    wp_store_id: targetStore._id,
-                    store_name:  targetStore.store_name,
-                    site_url:    targetStore.site_url,
-                    synced_at:   new Date(),
+                    wp_store_id:       targetStore._id,
+                    site_url:          targetStore.site_url,
+                    store_name:        targetStore.store_name,
+                    wp_product_id:     product.wp_product_id,
+                    name:              product.name,
+                    slug:              product.slug,
+                    description:       product.description,
+                    short_description: product.short_description,
+                    sku:               product.sku,
+                    price:             product.price,
+                    regular_price:     product.regular_price,
+                    sale_price:        product.sale_price,
+                    stock_status:      product.stock_status,
+                    stock_quantity:    product.stock_quantity,
+                    images:            product.images?.map(img => ({ id: img.id, src: img.src, alt: img.alt })) || [],
+                    categories:        product.categories?.map(c => ({ id: c.id, name: c.name, slug: c.slug })) || [],
+                    tags:              product.tags?.map(t => ({ id: t.id, name: t.name })) || [],
+                    status:            product.status,
+                    date_created:      product.date_created,
+                    currency:          product.currency,
+                    synced_at:         new Date(),
                 },
             },
             { upsert: true, new: true }
