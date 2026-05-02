@@ -94,7 +94,7 @@ const sellviaOrderSchema = new mongoose.Schema(
     exchange_rate:   { type: Number, default: 1 },
 
     customer_name:  { type: String, default: '', index: true },
-    customer_email: { type: String, default: '', index: true },
+    customer_email: { type: String, default: '' },
     customer_phone: { type: String, default: '' },
     customer:       { type: customerSchema, default: () => ({}) },
 

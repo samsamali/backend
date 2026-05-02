@@ -436,23 +436,37 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
 // ================================================================
 router.delete('/products/:productId/remove/:storeId', verifyToken, async (req, res) => {
     try {
-        const product = await WordpressProduct.findById(req.params.productId);
+        const [product, store] = await Promise.all([
+            WordpressProduct.findById(req.params.productId),
+            WordpressStore.findById(req.params.storeId),
+        ]);
         if (!product) return res.status(404).json({ error: 'Product not found' });
+        if (!store)   return res.status(404).json({ error: 'Store not found' });
 
-        const storeCount = await WordpressProduct.countDocuments({ wp_product_id: product.wp_product_id });
-        if (storeCount <= 1) {
-            return res.status(400).json({ error: 'Cannot remove product from its only store' });
+        // Try to delete from actual WordPress site via plugin
+        let wpDeleted = false;
+        if (store.site_url && store.token) {
+            try {
+                await axios.delete(
+                    `${store.site_url.replace(/\/$/, '')}/wp-json/marketsync/v1/products/${product.wp_product_id}`,
+                    { headers: { 'X-Marketsync-Token': store.token }, timeout: 15000 }
+                );
+                wpDeleted = true;
+            } catch (wpErr) {
+                console.warn(`[remove-product] WP delete failed (store=${store.store_name}): ${wpErr.message}`);
+            }
         }
 
+        // Always remove from MongoDB regardless of WP result
         await WordpressProduct.findOneAndDelete({
-            wp_store_id:   req.params.storeId,
+            wp_store_id:   store._id,
             wp_product_id: product.wp_product_id,
         });
 
-        const count = await WordpressProduct.countDocuments({ wp_store_id: req.params.storeId });
-        await WordpressStore.updateOne({ _id: req.params.storeId }, { $set: { total_products_cached: count } });
+        const count = await WordpressProduct.countDocuments({ wp_store_id: store._id });
+        await WordpressStore.updateOne({ _id: store._id }, { $set: { total_products_cached: count } });
 
-        res.json({ success: true });
+        res.json({ success: true, wp_deleted: wpDeleted });
     } catch (error) {
         res.status(500).json({ error: error.message });
     }
