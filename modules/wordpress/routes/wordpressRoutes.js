@@ -409,27 +409,49 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
             return res.status(400).json({ error: 'Target store is not connected' });
         }
 
-        // Build full payload with price, qty, categories, image
-        // Sellvia products store real price in `price`, but `regular_price` is often "0"
-        const effectivePrice   = parseFloat(product.price)          > 0 ? String(product.price)         : '0';
-        const effectiveRegular = parseFloat(product.regular_price)  > 0 ? String(product.regular_price) : effectivePrice;
-        const effectiveSale    = parseFloat(product.sale_price)     > 0 ? String(product.sale_price)    : '';
-        const effectiveQty     = parseInt(product.stock_quantity)   > 0 ? Number(product.stock_quantity) : null;
+        // If MongoDB has stale/zero price, fetch fresh data from the source WP store
+        let src = product;
+        if (parseFloat(product.price) <= 0) {
+            try {
+                const sourceStore = await WordpressStore.findById(product.wp_store_id);
+                if (sourceStore?.site_url && sourceStore?.token && product.wp_product_id) {
+                    const freshUrl = `${sourceStore.site_url.replace(/\/$/, '')}/wp-json/marketsync/v1/products/${product.wp_product_id}`;
+                    console.log(`[assign] price=0 in DB — fetching fresh from source: ${freshUrl}`);
+                    const freshRes = await axios.get(freshUrl, {
+                        headers: { 'X-Marketsync-Token': sourceStore.token },
+                        timeout: 15000,
+                    });
+                    const fp = freshRes.data?.data;
+                    if (fp && parseFloat(fp.price) > 0) {
+                        src = fp;
+                        console.log(`[assign] fresh price=${src.price} qty=${src.stock_quantity}`);
+                    }
+                }
+            } catch (freshErr) {
+                console.warn('[assign] Fresh price fetch failed:', freshErr.message);
+            }
+        }
+
+        // Build full payload — Sellvia regular_price is often "0", fall back to price
+        const effectivePrice   = parseFloat(src.price)          > 0 ? String(src.price)          : '0';
+        const effectiveRegular = parseFloat(src.regular_price)  > 0 ? String(src.regular_price)  : effectivePrice;
+        const effectiveSale    = parseFloat(src.sale_price)     > 0 ? String(src.sale_price)     : '';
+        const effectiveQty     = parseInt(src.stock_quantity)   > 0 ? Number(src.stock_quantity) : null;
 
         const payload = {
-            name:              product.name              || '',
-            description:       product.description       || '',
-            short_description: product.short_description || '',
-            sku:               product.sku               || '',
+            name:              src.name              || '',
+            description:       src.description       || '',
+            short_description: src.short_description || '',
+            sku:               src.sku               || '',
             price:             effectivePrice,
             regular_price:     effectiveRegular,
             sale_price:        effectiveSale,
-            stock_status:      product.stock_status      || 'instock',
+            stock_status:      src.stock_status      || 'instock',
             stock_quantity:    effectiveQty,
-            categories:        Array.isArray(product.categories)
-                                  ? product.categories.map(c => (typeof c === 'object' ? (c.name || '') : c)).filter(Boolean)
+            categories:        Array.isArray(src.categories)
+                                  ? src.categories.map(c => (typeof c === 'object' ? (c.name || '') : c)).filter(Boolean)
                                   : [],
-            image_url:         (Array.isArray(product.images) && product.images[0]?.src) ? product.images[0].src : '',
+            image_url:         (Array.isArray(src.images) && src.images[0]?.src) ? src.images[0].src : '',
         };
 
         // Push to target WordPress site via plugin
