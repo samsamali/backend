@@ -433,10 +433,14 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
         }
 
         // Build full payload — Sellvia regular_price is often "0", fall back to price
-        const effectivePrice   = parseFloat(src.price)          > 0 ? String(src.price)          : '0';
-        const effectiveRegular = parseFloat(src.regular_price)  > 0 ? String(src.regular_price)  : effectivePrice;
-        const effectiveSale    = parseFloat(src.sale_price)     > 0 ? String(src.sale_price)     : '';
-        const effectiveQty     = parseInt(src.stock_quantity)   > 0 ? Number(src.stock_quantity) : null;
+        const isSellvia      = src.platform === 'sellvia' || product.platform === 'sellvia';
+        const effectivePrice   = parseFloat(src.price)         > 0 ? String(src.price)         : '0';
+        const effectiveRegular = parseFloat(src.regular_price) > 0 ? String(src.regular_price) : effectivePrice;
+        const effectiveSale    = parseFloat(src.sale_price)    > 0 ? String(src.sale_price)    : '';
+        // Sellvia products have unlimited stock — default 1000000 if DB has 0/null
+        const effectiveQty     = parseInt(src.stock_quantity)  > 0
+            ? Number(src.stock_quantity)
+            : (isSellvia ? 1000000 : null);
 
         const payload = {
             name:              src.name              || '',
