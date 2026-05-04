@@ -410,16 +410,22 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
         }
 
         // Build full payload with price, qty, categories, image
+        // Sellvia products store real price in `price`, but `regular_price` is often "0"
+        const effectivePrice   = parseFloat(product.price)          > 0 ? String(product.price)         : '0';
+        const effectiveRegular = parseFloat(product.regular_price)  > 0 ? String(product.regular_price) : effectivePrice;
+        const effectiveSale    = parseFloat(product.sale_price)     > 0 ? String(product.sale_price)    : '';
+        const effectiveQty     = parseInt(product.stock_quantity)   > 0 ? Number(product.stock_quantity) : null;
+
         const payload = {
             name:              product.name              || '',
             description:       product.description       || '',
             short_description: product.short_description || '',
             sku:               product.sku               || '',
-            price:             String(product.price          ?? '0'),
-            regular_price:     String(product.regular_price  ?? product.price ?? '0'),
-            sale_price:        String(product.sale_price     ?? ''),
+            price:             effectivePrice,
+            regular_price:     effectiveRegular,
+            sale_price:        effectiveSale,
             stock_status:      product.stock_status      || 'instock',
-            stock_quantity:    product.stock_quantity != null ? Number(product.stock_quantity) : 0,
+            stock_quantity:    effectiveQty,
             categories:        Array.isArray(product.categories)
                                   ? product.categories.map(c => (typeof c === 'object' ? (c.name || '') : c)).filter(Boolean)
                                   : [],
