@@ -405,118 +405,69 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
         if (!product)     return res.status(404).json({ error: 'Product not found' });
         if (!targetStore) return res.status(404).json({ error: 'Store not found' });
 
-        let wpPushed = false;
-        let wpError  = null;
-        let finalWpProductId = product.wp_product_id;
-
-        // Push to WordPress store first (if connected)
-        if (targetStore.site_url && targetStore.token && targetStore.is_connected) {
-            const baseUrl = targetStore.site_url.replace(/\/$/, '');
-            const wpUrl   = `${baseUrl}/wp-json/marketsync/v1/products/${product.wp_product_id}`;
-            const payload = {
-                id:                product.wp_product_id,
-                name:              product.name,
-                slug:              product.slug,
-                description:       product.description,
-                short_description: product.short_description,
-                sku:               product.sku,
-                price:             product.price,
-                regular_price:     product.regular_price,
-                sale_price:        product.sale_price,
-                stock_status:      product.stock_status,
-                stock_quantity:    product.stock_quantity,
-                images:            product.images?.map(img => ({ id: img.id, src: img.src, alt: img.alt })) || [],
-                categories:        product.categories?.map(c => ({ id: c.id, name: c.name, slug: c.slug })) || [],
-                tags:              product.tags?.map(t => ({ id: t.id, name: t.name })) || [],
-                status:            product.status || 'publish',
-                currency:          product.currency || 'USD',
-            };
-
-            // Try PUT first (update if exists), fall back to POST (create new)
-            console.log(`[assign-product] Calling WP PUT → ${wpUrl}`);
-            try {
-                const wpRes = await axios.put(wpUrl, payload, {
-                    headers: { 'X-Marketsync-Token': targetStore.token },
-                    timeout: 15000,
-                });
-                console.log(`[assign-product] WP PUT success:`, wpRes.data?.data?.id || wpRes.data?.id);
-                const returnedId = wpRes.data?.data?.id || wpRes.data?.id;
-                if (returnedId) finalWpProductId = returnedId;
-                wpPushed = true;
-            } catch (wpErr) {
-                const status = wpErr.response?.status;
-                wpError = wpErr.response?.data || wpErr.message;
-                console.error(`[assign-product] WP PUT failed → status=${status}`);
-
-                if (status === 404) {
-                    // Product doesn't exist on target store — create it via POST
-                    const postUrl     = `${baseUrl}/wp-json/marketsync/v1/products`;
-                    const postPayload = {
-                        name:              product.name,
-                        description:       product.description,
-                        short_description: product.short_description,
-                        price:             product.price,
-                        regular_price:     product.regular_price,
-                        sale_price:        product.sale_price,
-                        sku:               product.sku,
-                        stock_status:      product.stock_status,
-                        stock_quantity:    product.stock_quantity,
-                        image_url:         product.images?.[0]?.src || '',
-                        categories:        product.categories?.map(c => c.name) || [],
-                    };
-                    console.log(`[assign-product] Calling WP POST → ${postUrl}`);
-                    try {
-                        const postRes = await axios.post(postUrl, postPayload, {
-                            headers: { 'X-Marketsync-Token': targetStore.token },
-                            timeout: 15000,
-                        });
-                        console.log(`[assign-product] WP POST success:`, postRes.data?.data?.id);
-                        const newId = postRes.data?.data?.id;
-                        if (newId) finalWpProductId = newId;
-                        wpPushed = true;
-                    } catch (postErr) {
-                        const postError = postErr.response?.data || postErr.message;
-                        console.error(`[assign-product] WP POST failed:`, JSON.stringify(postError));
-                        return res.status(502).json({
-                            error: `WordPress create failed: ${typeof postError === 'object' ? JSON.stringify(postError) : postError}`,
-                            wp_error: postError,
-                        });
-                    }
-                } else {
-                    return res.status(502).json({
-                        error: `WordPress add failed: ${typeof wpError === 'object' ? JSON.stringify(wpError) : wpError}`,
-                        wp_error: wpError,
-                    });
-                }
-            }
+        if (!targetStore.site_url || !targetStore.token || !targetStore.is_connected) {
+            return res.status(400).json({ error: 'Target store is not connected' });
         }
 
-        // Save to MongoDB only after successful WP push
+        // Build full payload with price, qty, categories, image
+        const payload = {
+            name:              product.name              || '',
+            description:       product.description       || '',
+            short_description: product.short_description || '',
+            sku:               product.sku               || '',
+            price:             String(product.price          ?? '0'),
+            regular_price:     String(product.regular_price  ?? product.price ?? '0'),
+            sale_price:        String(product.sale_price     ?? ''),
+            stock_status:      product.stock_status      || 'instock',
+            stock_quantity:    product.stock_quantity != null ? Number(product.stock_quantity) : 0,
+            categories:        Array.isArray(product.categories)
+                                  ? product.categories.map(c => (typeof c === 'object' ? (c.name || '') : c)).filter(Boolean)
+                                  : [],
+            image_url:         (Array.isArray(product.images) && product.images[0]?.src) ? product.images[0].src : '',
+        };
+
+        // Push to target WordPress site via plugin
+        const wpUrl = `${targetStore.site_url.replace(/\/$/, '')}/wp-json/marketsync/v1/products`;
+        console.log(`[assign] Calling WP POST → ${wpUrl} | name="${payload.name}" price=${payload.price} qty=${payload.stock_quantity}`);
+
+        let wpProductId = null;
+        try {
+            const wpRes = await axios.post(wpUrl, payload, {
+                headers: {
+                    'X-Marketsync-Token': targetStore.token,
+                    'Content-Type':       'application/json',
+                },
+                timeout: 30000,
+            });
+            console.log(`[assign] WP response:`, JSON.stringify(wpRes.data).slice(0, 300));
+            wpProductId = wpRes.data?.data?.id || null;
+        } catch (wpErr) {
+            const errBody = wpErr.response?.data || wpErr.message;
+            console.error(`[assign] WP POST failed:`, errBody);
+            return res.status(502).json({
+                error: 'Failed to create product on WordPress site',
+                wp_error: errBody,
+            });
+        }
+
+        if (!wpProductId) {
+            return res.status(502).json({ error: 'WordPress did not return a product ID' });
+        }
+
+        // Save to MongoDB with the NEW WP product ID returned by plugin
+        const data = product.toObject();
+        delete data._id; delete data.__v; delete data.created_at; delete data.updated_at;
+
         const saved = await WordpressProduct.findOneAndUpdate(
-            { wp_store_id: targetStore._id, wp_product_id: finalWpProductId },
+            { wp_store_id: targetStore._id, wp_product_id: wpProductId },
             {
                 $set: {
-                    wp_store_id:       targetStore._id,
-                    site_url:          targetStore.site_url,
-                    store_name:        targetStore.store_name,
-                    wp_product_id:     finalWpProductId,
-                    name:              product.name,
-                    slug:              product.slug,
-                    description:       product.description,
-                    short_description: product.short_description,
-                    sku:               product.sku,
-                    price:             product.price,
-                    regular_price:     product.regular_price,
-                    sale_price:        product.sale_price,
-                    stock_status:      product.stock_status,
-                    stock_quantity:    product.stock_quantity,
-                    images:            product.images?.map(img => ({ id: img.id, src: img.src, alt: img.alt })) || [],
-                    categories:        product.categories?.map(c => ({ id: c.id, name: c.name, slug: c.slug })) || [],
-                    tags:              product.tags?.map(t => ({ id: t.id, name: t.name })) || [],
-                    status:            product.status,
-                    date_created:      product.date_created,
-                    currency:          product.currency,
-                    synced_at:         new Date(),
+                    ...data,
+                    wp_store_id:   targetStore._id,
+                    wp_product_id: wpProductId,
+                    store_name:    targetStore.store_name,
+                    site_url:      targetStore.site_url,
+                    synced_at:     new Date(),
                 },
             },
             { upsert: true, new: true }
@@ -525,8 +476,9 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
         const count = await WordpressProduct.countDocuments({ wp_store_id: targetStore._id });
         await WordpressStore.updateOne({ _id: targetStore._id }, { $set: { total_products_cached: count } });
 
-        res.json({ success: true, product: saved, wp_pushed: wpPushed });
+        res.json({ success: true, product: saved, wp_product_id: wpProductId });
     } catch (error) {
+        console.error('[assign] error:', error);
         res.status(500).json({ error: error.message });
     }
 });
