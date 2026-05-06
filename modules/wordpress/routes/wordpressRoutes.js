@@ -614,4 +614,61 @@ router.delete('/products/:productId/remove/:storeId', verifyToken, async (req, r
     }
 });
 
+// ================================================================
+//  PROTECTED — Update product (frontend → WordPress → MongoDB)
+// ================================================================
+router.put('/products/:productId', verifyToken, async (req, res) => {
+    try {
+        const product = await WordpressProduct.findById(req.params.productId);
+        if (!product) return res.status(404).json({ error: 'Product not found' });
+
+        const store = await WordpressStore.findById(product.wp_store_id);
+        if (!store) return res.status(404).json({ error: 'Store not found' });
+
+        const { name, description, short_description, price, sale_price, stock_quantity, sku, stock_status } = req.body;
+
+        const updateData = {};
+        if (name              !== undefined) updateData.name              = name;
+        if (description       !== undefined) updateData.description       = description;
+        if (short_description !== undefined) updateData.short_description = short_description;
+        if (sku               !== undefined) updateData.sku               = sku;
+        if (stock_status      !== undefined) updateData.stock_status      = stock_status;
+        if (price             !== undefined) {
+            updateData.price         = String(price);
+            updateData.regular_price = String(price);
+        }
+        if (sale_price        !== undefined) updateData.sale_price     = String(sale_price);
+        if (stock_quantity    !== undefined) updateData.stock_quantity = Number(stock_quantity);
+
+        // Step 1: Update WordPress via plugin
+        if (store.site_url && store.token && store.is_connected) {
+            const wpUrl = `${store.site_url.replace(/\/$/, '')}/wp-json/marketsync/v1/products/${product.wp_product_id}`;
+            console.log(`[update] WP PUT → ${wpUrl}`);
+            try {
+                const wpRes = await axios.put(wpUrl, updateData, {
+                    headers: { 'X-Marketsync-Token': store.token, 'Content-Type': 'application/json' },
+                    timeout: 30000,
+                });
+                console.log(`[update] WP response:`, JSON.stringify(wpRes.data).slice(0, 200));
+            } catch (wpErr) {
+                console.error(`[update] WP PUT failed:`, wpErr.response?.data || wpErr.message);
+                return res.status(502).json({
+                    error: 'WordPress update failed',
+                    wp_error: wpErr.response?.data || wpErr.message,
+                });
+            }
+        }
+
+        // Step 2: Update MongoDB
+        Object.assign(product, updateData);
+        product.synced_at = new Date();
+        await product.save();
+
+        res.json({ success: true, product });
+    } catch (error) {
+        console.error('[update] error:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 module.exports = router;
