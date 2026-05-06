@@ -368,9 +368,23 @@ router.get('/products/:productId/store-status', verifyToken, async (req, res) =>
         const product = await WordpressProduct.findById(req.params.productId);
         if (!product) return res.status(404).json({ error: 'Product not found' });
 
+        // Resolve the canonical source ID:
+        // - If this product was assigned FROM another, source_product_id points to the original
+        // - Otherwise this product IS the source
+        const sourceId = product.source_product_id
+            ? String(product.source_product_id)
+            : String(product._id);
+
         const [stores, assignments] = await Promise.all([
             WordpressStore.find({}).sort({ store_name: 1 }),
-            WordpressProduct.find({ wp_product_id: product.wp_product_id }).select('wp_store_id _id'),
+            WordpressProduct.find({
+                $or: [
+                    // The source product itself (on its original store)
+                    { _id: sourceId },
+                    // Copies assigned from this source to other stores
+                    { source_product_id: sourceId },
+                ],
+            }).select('wp_store_id _id'),
         ]);
 
         const assignedMap = {};
@@ -379,11 +393,11 @@ router.get('/products/:productId/store-status', verifyToken, async (req, res) =>
         }
 
         const storeStatus = stores.map(s => ({
-            _id:         s._id,
-            store_name:  s.store_name,
-            site_url:    s.site_url,
-            is_connected: s.is_connected,
-            has_product: !!assignedMap[String(s._id)],
+            _id:            s._id,
+            store_name:     s.store_name,
+            site_url:       s.site_url,
+            is_connected:   s.is_connected,
+            has_product:    !!assignedMap[String(s._id)],
             product_doc_id: assignedMap[String(s._id)] || null,
         }));
 
@@ -490,16 +504,22 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
         const data = product.toObject();
         delete data._id; delete data.__v; delete data.created_at; delete data.updated_at;
 
+        // source_product_id links this copy back to the original so store-status can find it
+        const sourceProductId = product.source_product_id
+            ? String(product.source_product_id)
+            : String(product._id);
+
         const saved = await WordpressProduct.findOneAndUpdate(
             { wp_store_id: targetStore._id, wp_product_id: wpProductId },
             {
                 $set: {
                     ...data,
-                    wp_store_id:   targetStore._id,
-                    wp_product_id: wpProductId,
-                    store_name:    targetStore.store_name,
-                    site_url:      targetStore.site_url,
-                    synced_at:     new Date(),
+                    source_product_id: sourceProductId,
+                    wp_store_id:       targetStore._id,
+                    wp_product_id:     wpProductId,
+                    store_name:        targetStore.store_name,
+                    site_url:          targetStore.site_url,
+                    synced_at:         new Date(),
                 },
             },
             { upsert: true, new: true }
@@ -527,28 +547,51 @@ router.delete('/products/:productId/remove/:storeId', verifyToken, async (req, r
         if (!product) return res.status(404).json({ error: 'Product not found' });
         if (!store)   return res.status(404).json({ error: 'Store not found' });
 
-        // Delete from actual WordPress site via plugin
+        // Find the actual document that lives on the target store.
+        // If the passed product belongs to a different store (cross-store remove),
+        // look up the assigned copy via source_product_id.
+        let docToRemove = product;
+        if (String(product.wp_store_id) !== String(store._id)) {
+            const sourceId = product.source_product_id
+                ? String(product.source_product_id)
+                : String(product._id);
+
+            const copy = await WordpressProduct.findOne({
+                wp_store_id: store._id,
+                $or: [
+                    { source_product_id: sourceId },
+                    { source_product_id: String(product._id) },
+                ],
+            });
+
+            if (!copy) {
+                // Already removed from MongoDB — just update count
+                const count = await WordpressProduct.countDocuments({ wp_store_id: store._id });
+                await WordpressStore.updateOne({ _id: store._id }, { $set: { total_products_cached: count } });
+                return res.json({ success: true, wp_deleted: false, note: 'No copy found in store' });
+            }
+            docToRemove = copy;
+        }
+
+        // Delete from WordPress using the TARGET store's WP product ID
         let wpDeleted = false;
         let wpError   = null;
         if (store.site_url && store.token) {
-            const wpUrl = `${store.site_url.replace(/\/$/, '')}/wp-json/marketsync/v1/products/${product.wp_product_id}`;
-            console.log(`[remove-product] Calling WP DELETE → ${wpUrl}`);
+            const wpUrl = `${store.site_url.replace(/\/$/, '')}/wp-json/marketsync/v1/products/${docToRemove.wp_product_id}`;
+            console.log(`[remove] WP DELETE → ${wpUrl}`);
             try {
-                const wpRes = await axios.delete(wpUrl, {
+                await axios.delete(wpUrl, {
                     headers: { 'X-Marketsync-Token': store.token },
                     timeout: 15000,
                 });
-                console.log(`[remove-product] WP response:`, JSON.stringify(wpRes.data));
                 wpDeleted = true;
             } catch (wpErr) {
                 const status = wpErr.response?.status;
                 wpError = wpErr.response?.data || wpErr.message;
-                console.error(`[remove-product] WP DELETE failed → status=${status} body=${JSON.stringify(wpErr.response?.data)} msg=${wpErr.message}`);
-                // 404 means product already doesn't exist on WP — treat as deleted
-                if (status === 404) wpDeleted = true;
+                console.error(`[remove] WP DELETE failed status=${status}`, wpError);
+                if (status === 404) wpDeleted = true; // already gone on WP
             }
         } else {
-            // No WP connection info — just remove from MongoDB
             wpDeleted = true;
         }
 
@@ -559,11 +602,8 @@ router.delete('/products/:productId/remove/:storeId', verifyToken, async (req, r
             });
         }
 
-        // Remove from MongoDB only after successful WP deletion
-        await WordpressProduct.findOneAndDelete({
-            wp_store_id:   store._id,
-            wp_product_id: product.wp_product_id,
-        });
+        // Delete the copy document from MongoDB
+        await WordpressProduct.findByIdAndDelete(docToRemove._id);
 
         const count = await WordpressProduct.countDocuments({ wp_store_id: store._id });
         await WordpressStore.updateOne({ _id: store._id }, { $set: { total_products_cached: count } });
