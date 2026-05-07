@@ -249,9 +249,9 @@ exports.signup = async (req, res) => {
 
     if (!isSuperAdminRole && companyId) {
         try {
-            const CompanyStore = require('../models/CompanyStore');
-            const UserCompany  = require('../models/UserCompany');
-            const Company      = require('../models/Company');
+            const CompanyStore = require('../../admin/models/CompanyStore');
+            const UserCompany  = require('../../admin/models/UserCompany');
+            const Company      = require('../../company/models/Company');
 
             const company = await Company.findById(companyId);
             if (company) {
@@ -425,8 +425,8 @@ exports.login = async (req, res) => {
 
     if (!isSA) {
         try {
-            const CompanyStore = require('../models/CompanyStore');
-            const UserCompany  = require('../models/UserCompany');
+            const CompanyStore = require('../../admin/models/CompanyStore');
+            const UserCompany  = require('../../admin/models/UserCompany');
 
             const userComp = await UserCompany.findOne({
                 userId:   user._id,
