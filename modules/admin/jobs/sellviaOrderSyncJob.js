@@ -21,7 +21,7 @@ const fetchOrdersFromAPI = async (dashboard, store, pageNo = 1, pageSize = 100) 
       requestBody,
       {
         headers: {
-          'Authorization': dashboard.jwt_token,
+          'Authorization': (dashboard.jwt_token || '').trim(),
           'Accept': 'application/json, text/plain, */*',
           'Content-Type': 'application/json',
           'Origin': dashboard.base_url,
