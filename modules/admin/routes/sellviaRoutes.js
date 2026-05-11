@@ -164,12 +164,12 @@ const fetchOrdersPage = async (store, pageNo, pageSize) => {
             `${dashboard.base_url}/rest/v1/account/orders/list`, body,
             {
                 headers: {
-                    'Authorization':    dashboard.jwt_token,
+                    'Authorization':    (dashboard.jwt_token || '').trim(),
                     'Accept':           'application/json, text/plain, */*',
                     'Content-Type':     'application/json',
                     'Origin':           dashboard.base_url,
                     'Referer':          `${dashboard.base_url}/me/account`,
-                    'Cookie':           `sell_account_token=${dashboard.jwt_token}`,
+                    'Cookie':           `sell_account_token=${(dashboard.jwt_token || '').trim()}`,
                     'X-Requested-With': 'XMLHttpRequest',
                     'User-Agent':       'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
                 },
@@ -395,8 +395,8 @@ const serializeOrder = (o) => ({
 // ================================================================
 const syncStoreInfoFromAPI = async (dashboard, dashboard_id) => {
     const headers = {
-        'Authorization': dashboard.jwt_token, 'Content-Type': 'application/x-www-form-urlencoded',
-        'Cookie': `sell_account_token=${dashboard.jwt_token}`, 'X-Requested-With': 'XMLHttpRequest', 'User-Agent': 'Mozilla/5.0',
+        'Authorization': (dashboard.jwt_token || '').trim(), 'Content-Type': 'application/x-www-form-urlencoded',
+        'Cookie': `sell_account_token=${(dashboard.jwt_token || '').trim()}`, 'X-Requested-With': 'XMLHttpRequest', 'User-Agent': 'Mozilla/5.0',
     };
 
     let storeList = [];
@@ -1024,9 +1024,9 @@ router.post('/sync-home-data/:dashboard_id', verifyToken, async (req, res) => {
                 `${dashboard.base_url}/rest/v1/account/MyAccount/getMyAccountData`, {},
                 {
                     headers: {
-                        'Authorization':    dashboard.jwt_token,
+                        'Authorization':    (dashboard.jwt_token || '').trim(),
                         'Content-Type':     'application/x-www-form-urlencoded',
-                        'Cookie':           `sell_account_token=${dashboard.jwt_token}`,
+                        'Cookie':           `sell_account_token=${(dashboard.jwt_token || '').trim()}`,
                         'X-Requested-With': 'XMLHttpRequest',
                         'User-Agent':       'Mozilla/5.0',
                     },

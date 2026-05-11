@@ -26,7 +26,7 @@ const fetchOrdersFromAPI = async (dashboard, store, pageNo = 1, pageSize = 100) 
           'Content-Type': 'application/json',
           'Origin': dashboard.base_url,
           'Referer': `${dashboard.base_url}/me/account`,
-          'Cookie': `sell_account_token=${dashboard.jwt_token}`,
+          'Cookie': `sell_account_token=${(dashboard.jwt_token || '').trim()}`,
           'X-Requested-With': 'XMLHttpRequest',
           'User-Agent': 'Mozilla/5.0',
         },
