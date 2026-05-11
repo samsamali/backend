@@ -60,6 +60,9 @@ app.use(
 
 
 
+// Health check for Railway
+app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
 // Register routes (Backend API Routes)
 app.use('/api/auth', auth);
 app.use('/api/companies', companyRoutes);
