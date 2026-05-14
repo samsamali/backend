@@ -502,15 +502,16 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
                 if (preparedPostId) {
                     // STEP 2: Connect — Sellvia may exit/die; that's expected
                     try {
-                        await axios.post(
+                        const connectRes = await axios.post(
                             `${base}/wp-json/marketsync/v1/sellvia-import-connect`,
                             { post_id: preparedPostId, sellvia_id: product.sellvia_id },
                             { headers, timeout: 60000 }
                         );
-                        console.log(`[assign]   step2 connect → returned cleanly`);
+                        const cd = connectRes.data || {};
+                        console.log(`[assign]   step2 connect → returned cleanly | slv_entry=${cd.slv_entry || 'none'} | sellvia_output=${JSON.stringify(cd.sellvia_output || '').slice(0, 150)}`);
                     } catch (connectErr) {
                         // Sellvia killed the script — totally expected, not an error
-                        console.log(`[assign]   step2 connect → script exited (expected)`);
+                        console.log(`[assign]   step2 connect → script exited (expected) | raw=${JSON.stringify(connectErr.response?.data || connectErr.message).slice(0, 150)}`);
                     }
 
                     // Give Sellvia's shutdown handler a moment to finish
@@ -522,13 +523,13 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
                             `${base}/wp-json/marketsync/v1/sellvia-import-verify/${preparedPostId}`,
                             { headers, timeout: 30000 }
                         );
-                        if (verifyRes.data?.connected && verifyRes.data?.wp_product_id) {
-                            wpProductId = verifyRes.data.wp_product_id;
+                        const vd = verifyRes.data || {};
+                        if (vd.connected && vd.wp_product_id) {
+                            wpProductId = vd.wp_product_id;
                             importMethod = 'sellvia';
-                            console.log(`[assign] ✅ Sellvia import SUCCESS! wp_product_id=${wpProductId}`);
+                            console.log(`[assign] ✅ Sellvia import SUCCESS! wp_product_id=${wpProductId} (real slv entry confirmed)`);
                         } else {
-                            console.warn('[assign] ⚠️ Sellvia verify: not connected →',
-                                verifyRes.data?.reason || 'unknown');
+                            console.warn(`[assign] ⚠️ Sellvia verify: NOT connected → reason=${vd.reason || 'unknown'} status=${vd.post_status || '?'} — will fall back to manual`);
                         }
                     } catch (verifyErr) {
                         console.warn('[assign]   step3 verify failed:',
