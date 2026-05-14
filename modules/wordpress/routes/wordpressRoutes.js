@@ -467,37 +467,76 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
         let importMethod = 'manual';
 
         // ════════════════════════════════════════════════════════════
-        //  PRIORITY 1: Sellvia Native Import (if sellvia_id exists)
-        //  This creates a proper Sellvia-connected product
-        //  → Public URL works ✅
-        //  → wp_slv_products entry created ✅
-        //  → Sellvia features active ✅
+        //  PRIORITY 1: Sellvia Native Import — ROBUST 3-STEP FLOW
+        //  Sellvia's connect handler calls exit/die, so we use:
+        //   1. prepare  → get a clean post_id
+        //   2. connect  → trigger Sellvia (it may die, doesn't matter)
+        //   3. verify   → confirm the product is connected
+        //  → Public URL works ✅  wp_slv_products entry ✅  feedback/qty ✅
         // ════════════════════════════════════════════════════════════
         if (product.sellvia_id) {
             try {
-                const sellviaImportUrl = `${targetStore.site_url.replace(/\/$/, '')}/wp-json/marketsync/v1/sellvia-import`;
-                console.log(`[assign] 🎯 Trying Sellvia native import → sellvia_id=${product.sellvia_id}`);
+                const base = targetStore.site_url.replace(/\/$/, '');
+                const headers = {
+                    'X-Marketsync-Token': targetStore.token,
+                    'Content-Type':       'application/json',
+                };
 
-                const sellviaRes = await axios.post(sellviaImportUrl, {
-                    sellvia_id: product.sellvia_id,
-                    name:       product.name,
-                }, {
-                    headers: {
-                        'X-Marketsync-Token': targetStore.token,
-                        'Content-Type':       'application/json',
-                    },
-                    timeout: 60000,
-                });
+                console.log(`[assign] 🎯 Sellvia import (3-step) → sellvia_id=${product.sellvia_id}`);
 
-                if (sellviaRes.data?.success && sellviaRes.data?.wp_product_id) {
-                    wpProductId = sellviaRes.data.wp_product_id;
-                    importMethod = 'sellvia';
-                    console.log(`[assign] ✅ Sellvia import SUCCESS! wp_product_id=${wpProductId}`);
-                } else {
-                    console.warn('[assign] ⚠️ Sellvia import returned unexpected response:', sellviaRes.data);
+                // STEP 1: Prepare — get a clean post_id (no Sellvia call, safe)
+                let preparedPostId = null;
+                try {
+                    const prepRes = await axios.post(
+                        `${base}/wp-json/marketsync/v1/sellvia-import-prepare`,
+                        { sellvia_id: product.sellvia_id, name: product.name },
+                        { headers, timeout: 30000 }
+                    );
+                    preparedPostId = prepRes.data?.post_id || null;
+                    console.log(`[assign]   step1 prepare → post_id=${preparedPostId}`);
+                } catch (prepErr) {
+                    console.warn('[assign]   step1 prepare failed:',
+                        prepErr.response?.data || prepErr.message);
+                }
+
+                if (preparedPostId) {
+                    // STEP 2: Connect — Sellvia may exit/die; that's expected
+                    try {
+                        await axios.post(
+                            `${base}/wp-json/marketsync/v1/sellvia-import-connect`,
+                            { post_id: preparedPostId, sellvia_id: product.sellvia_id },
+                            { headers, timeout: 60000 }
+                        );
+                        console.log(`[assign]   step2 connect → returned cleanly`);
+                    } catch (connectErr) {
+                        // Sellvia killed the script — totally expected, not an error
+                        console.log(`[assign]   step2 connect → script exited (expected)`);
+                    }
+
+                    // Give Sellvia's shutdown handler a moment to finish
+                    await new Promise(r => setTimeout(r, 3000));
+
+                    // STEP 3: Verify — confirm connection (deletes draft if failed)
+                    try {
+                        const verifyRes = await axios.get(
+                            `${base}/wp-json/marketsync/v1/sellvia-import-verify/${preparedPostId}`,
+                            { headers, timeout: 30000 }
+                        );
+                        if (verifyRes.data?.connected && verifyRes.data?.wp_product_id) {
+                            wpProductId = verifyRes.data.wp_product_id;
+                            importMethod = 'sellvia';
+                            console.log(`[assign] ✅ Sellvia import SUCCESS! wp_product_id=${wpProductId}`);
+                        } else {
+                            console.warn('[assign] ⚠️ Sellvia verify: not connected →',
+                                verifyRes.data?.reason || 'unknown');
+                        }
+                    } catch (verifyErr) {
+                        console.warn('[assign]   step3 verify failed:',
+                            verifyErr.response?.data || verifyErr.message);
+                    }
                 }
             } catch (sellviaErr) {
-                console.warn('[assign] ⚠️ Sellvia import failed, falling back to manual:',
+                console.warn('[assign] ⚠️ Sellvia import error, falling back to manual:',
                     sellviaErr.response?.data || sellviaErr.message);
             }
         }
