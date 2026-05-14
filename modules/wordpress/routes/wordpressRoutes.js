@@ -500,22 +500,25 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
                 }
 
                 if (preparedPostId) {
-                    // STEP 2: Connect — Sellvia may exit/die; that's expected
+                    // STEP 2: Connect — loopback to admin-ajax.php (synchronous).
+                    // Connect now does the real work + finalize itself.
+                    let connectSaysConnected = false;
                     try {
                         const connectRes = await axios.post(
                             `${base}/wp-json/marketsync/v1/sellvia-import-connect`,
                             { post_id: preparedPostId, sellvia_id: product.sellvia_id },
-                            { headers, timeout: 60000 }
+                            { headers, timeout: 90000 }
                         );
                         const cd = connectRes.data || {};
-                        console.log(`[assign]   step2 connect → returned cleanly | slv_entry=${cd.slv_entry || 'none'} | sellvia_output=${JSON.stringify(cd.sellvia_output || '').slice(0, 150)}`);
+                        connectSaysConnected = !!cd.connected;
+                        console.log(`[assign]   step2 connect → connected=${cd.connected} slv_entry=${cd.slv_entry || 'none'}`);
+                        console.log(`[assign]   step2 diagnostics: ${JSON.stringify(cd.diagnostics || {}).slice(0, 400)}`);
                     } catch (connectErr) {
-                        // Sellvia killed the script — totally expected, not an error
-                        console.log(`[assign]   step2 connect → script exited (expected) | raw=${JSON.stringify(connectErr.response?.data || connectErr.message).slice(0, 150)}`);
+                        console.log(`[assign]   step2 connect → error: ${JSON.stringify(connectErr.response?.data || connectErr.message).slice(0, 250)}`);
                     }
 
-                    // Give Sellvia's shutdown handler a moment to finish
-                    await new Promise(r => setTimeout(r, 3000));
+                    // Brief pause, then verify as the final word
+                    await new Promise(r => setTimeout(r, 1500));
 
                     // STEP 3: Verify — confirm connection (deletes draft if failed)
                     try {
