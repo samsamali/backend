@@ -512,7 +512,7 @@ router.post('/products/:productId/assign/:storeId', verifyToken, async (req, res
                         );
                         const cd = connectRes.data || {};
                         console.log(`[assign]   step2 connect → connected=${cd.connected} post_id=${cd.wp_product_id || cd.post_id || '?'} slv_entry=${cd.slv_entry || 'none'} method=${cd.method || '?'}`);
-                        console.log(`[assign]   step2 diagnostics: ${JSON.stringify(cd.diagnostics || {}).slice(0, 500)}`);
+                        console.log(`[assign]   step2 diagnostics: ${JSON.stringify(cd.diagnostics || {})}`);
                         if (cd.connected && cd.wp_product_id) {
                             connectedPostId = cd.wp_product_id;
                         }
